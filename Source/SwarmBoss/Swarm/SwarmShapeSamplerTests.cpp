@@ -141,6 +141,16 @@ bool FSwarmPreviewTest::RunTest(const FString& Parameters)
 		TestTrue(TEXT("Instance transform exists"), Preview->Instances->GetInstanceTransform(0, Instance, false));
 		TestTrue(TEXT("Particle scale independent of shape"), Instance.GetScale3D().Equals(FVector(0.2), 1.e-6));
 
+		TestTrue(TEXT("Query-only profile"), Preview->Instances->GetCollisionEnabled() == ECollisionEnabled::QueryOnly);
+		TestTrue(TEXT("SwarmSphere object type"), Preview->Instances->GetCollisionObjectType() == ECC_GameTraceChannel3);
+		TestTrue(TEXT("PlayerProjectile overlap response"),
+			Preview->Instances->GetCollisionResponseToChannel(ECC_GameTraceChannel2) == ECR_Overlap);
+		TestFalse(TEXT("Null hit rejected"), Preview->HighlightInstance(nullptr, 0));
+		TestFalse(TEXT("Negative index rejected"), Preview->HighlightInstance(Preview->Instances.Get(), -1));
+		TestFalse(TEXT("Out-of-range index rejected"), Preview->HighlightInstance(Preview->Instances.Get(), 50));
+		Preview->SetActorLocationAndRotation(FVector(100, 200, 300), FRotator(0, 90, 0));
+		TestTrue(TEXT("Valid instance highlighted after transform"), Preview->HighlightInstance(Preview->Instances.Get(), 0));
+
 		const int32 PreviousCount = Preview->Instances->GetInstanceCount();
 		Preview->Settings.SpacingMargin = -1;
 		AddExpectedError(TEXT("Invalid sampling settings."), EAutomationExpectedErrorFlags::Contains, 1);
@@ -149,6 +159,46 @@ bool FSwarmPreviewTest::RunTest(const FString& Parameters)
 
 		Preview->ClearPreview();
 		TestEqual(TEXT("Clear removes all instances"), Preview->Instances->GetInstanceCount(), 0);
+
+		// 이동·회전된 Actor의 단일 구체를 엔진 Object Trace로 식별한다.
+		Preview->Settings.SpacingMargin = 2;
+		Preview->Settings.ParticleCount = 1;
+		Preview->GeneratePreview();
+
+		FCollisionObjectQueryParams ObjectQuery;
+		ObjectQuery.AddObjectTypesToQuery(ECC_GameTraceChannel3);
+
+		const FVector Center = Preview->GetActorLocation();
+		FHitResult Hit;
+		const bool bHit = World->LineTraceSingleByObjectType(
+			Hit,
+			Center - FVector(100, 0, 0),
+			Center + FVector(100, 0, 0),
+			ObjectQuery);
+
+		TestTrue(TEXT("Object trace hits query-only sphere"), bHit);
+		TestTrue(TEXT("Trace identifies preview component"), Hit.GetComponent() == Preview->Instances.Get());
+		TestEqual(TEXT("Trace returns instance zero"), Hit.Item, 0);
+		TestTrue(TEXT("Trace result can be highlighted"), Preview->HighlightInstance(Hit.GetComponent(), Hit.Item));
+
+		TestFalse(TEXT("Null removal target rejected"), Preview->RemoveInstance(nullptr, 0));
+		TestFalse(TEXT("Negative removal index rejected"), Preview->RemoveInstance(Preview->Instances.Get(), -1));
+		TestFalse(TEXT("Out-of-range removal rejected"), Preview->RemoveInstance(Preview->Instances.Get(), 1));
+		TestEqual(TEXT("Invalid removal preserves instance"), Preview->Instances->GetInstanceCount(), 1);
+
+		TestTrue(TEXT("Hit instance removed"), Preview->RemoveInstance(Hit.GetComponent(), Hit.Item));
+		TestEqual(TEXT("No instance remains"), Preview->Instances->GetInstanceCount(), 0);
+		TestEqual(TEXT("GeneratedCount follows actual instances"), Preview->GeneratedCount, 0);
+		TestEqual(TEXT("Regeneration setting preserved"), Preview->Settings.ParticleCount, 1);
+
+		FHitResult HitAfterRemoval;
+		TestFalse(TEXT("Removed sphere no longer collides"), World->LineTraceSingleByObjectType(
+			HitAfterRemoval,
+			Center - FVector(100, 0, 0),
+			Center + FVector(100, 0, 0),
+			ObjectQuery));
+
+
 	}
 
 	World->DestroyWorld(false);

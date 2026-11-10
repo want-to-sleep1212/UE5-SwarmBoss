@@ -228,7 +228,7 @@ FSwarmSamplingResult FSwarmShapeSampler::GenerateTargets(const FSwarmSamplingSet
 
 		if (Result.Points.Num() >= S.ParticleCount)
 		{
-			// N개에서 즉시 중단하면 시작점 주변만 채워진다. 영역을 샘플링한 뒤 균일하게 부분 선택한다.
+			// N개에서 즉시 중단하면 시작점 주변만 채워진다. 섞은 뒤 균일하게 부분 선택한다.
 			for (int32 I = 0; I < S.ParticleCount; ++I)
 			{
 				Result.Points.Swap(I, Random.RandRange(I, Result.Points.Num() - 1));

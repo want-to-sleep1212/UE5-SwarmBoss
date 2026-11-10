@@ -1,16 +1,18 @@
 // SwarmShapePreview.cpp
 // ASwarmShapePreview 구현.
-// - 생성자: 충돌 없는 ISM 컴포넌트를 루트로 만들고 엔진 기본 구체 메시(반지름 50cm)를 지정한다.
+// - 생성자: SwarmSpherePreset을 사용하는 ISM을 루트로 만들고 엔진 기본 구체 메시를 지정한다.
 // - OnConstruction(): Actor Scale을 1로 고정한다. 도형 크기는 Settings로만 결정한다.
 // - GeneratePreview(): 샘플러를 호출해 보고 문자열과 로그(LogSwarmShape)를 남기고, 성공 시에만 인스턴스를 교체한다.
 //   실패하면 기존 미리보기를 유지한다. 구체 스케일은 ParticleRadius로만 정한다. BeginPlay에서도 한 번 실행한다.
 // - ClearPreview(): 모든 인스턴스와 결과 값을 초기화한다.
 // - ShowBounds(): 적용된 중심 허용 영역을 10초간 디버그 도형으로 표시한다.
+// - HighlightInstance(): 인스턴스 번호로 조회한 월드 위치에 녹색 테두리를 2초간 표시한다.
 
 #include "SwarmShapePreview.h"
 
 #include "Components/InstancedStaticMeshComponent.h"
 #include "DrawDebugHelpers.h"
+#include "Engine/StaticMesh.h"
 #include "UObject/ConstructorHelpers.h"
 
 DEFINE_LOG_CATEGORY_STATIC(LogSwarmShape, Log, All);
@@ -23,7 +25,7 @@ ASwarmShapePreview::ASwarmShapePreview()
 	SetRootComponent(Instances);
 
 	Instances->SetMobility(EComponentMobility::Movable);
-	Instances->SetCollisionEnabled(ECollisionEnabled::NoCollision);
+	Instances->SetCollisionProfileName(TEXT("SwarmSpherePreset"));
 	Instances->SetCanEverAffectNavigation(false);
 
 	static ConstructorHelpers::FObjectFinder<UStaticMesh> Sphere(TEXT("/Engine/BasicShapes/Sphere.Sphere"));
@@ -74,6 +76,8 @@ void ASwarmShapePreview::GeneratePreview()
 	}
 
 	Instances->ClearInstances();
+	// 기존 레벨에 NoCollision으로 저장된 Actor도 재생성하면 새 프리셋을 적용한다.
+	Instances->SetCollisionProfileName(TEXT("SwarmSpherePreset"));
 	Instances->AddInstances(Transforms, false, false, false);
 
 	GeneratedCount = Result.Points.Num();
@@ -110,4 +114,60 @@ void ASwarmShapePreview::ShowBounds()
 	{
 		DrawDebugBox(GetWorld(), GetActorLocation(), AppliedHalfExtents, GetActorQuat(), FColor::Cyan, false, 10.0f);
 	}
+}
+
+bool ASwarmShapePreview::HighlightInstance(const UPrimitiveComponent* HitComponent, int32 InstanceIndex)
+{
+	if (!IsValid(Instances) || HitComponent != Instances.Get() || !GetWorld()
+		|| InstanceIndex < 0 || InstanceIndex >= Instances->GetInstanceCount())
+	{
+		return false;
+	}
+
+	const UStaticMesh* Mesh = Instances->GetStaticMesh();
+	FTransform WorldTransform;
+
+	if (!Mesh || !Instances->GetInstanceTransform(InstanceIndex, WorldTransform, true))
+	{
+		return false;
+	}
+
+	// 충돌 지점이 아닌 번호로 조회한 위치를 표시해야 번호 매핑을 검증할 수 있다.
+	// 현재 Settings는 재생성 전 값일 수 있으므로 실제 메시 크기와 인스턴스 Scale을 사용한다.
+	const FBoxSphereBounds Bounds = Mesh->GetBounds();
+	const FVector Center = WorldTransform.TransformPosition(Bounds.Origin);
+	const double Radius = Bounds.BoxExtent.GetMax() * WorldTransform.GetScale3D().GetAbsMax() * 1.1;
+
+	DrawDebugSphere(GetWorld(), Center, Radius, 24, FColor::Green, false, 2.0f, 0, 1.5f);
+
+	UE_LOG(LogSwarmShape, Display, TEXT("Highlight Instance=%d Center=%s"), InstanceIndex, *Center.ToString());
+
+	return true;
+}
+
+bool ASwarmShapePreview::RemoveInstance(const UPrimitiveComponent* HitComponent, int32 InstanceIndex)
+{
+	if (!IsValid(Instances) || HitComponent != Instances.Get())
+	{
+		return false;
+	}
+
+	if (InstanceIndex < 0 || InstanceIndex >= Instances->GetInstanceCount())
+	{
+		return false;
+	}
+
+	if (!Instances->RemoveInstance(InstanceIndex))
+	{
+		return false;
+	}
+
+	GeneratedCount = Instances->GetInstanceCount();
+
+	UE_LOG(LogSwarmShape, Display,
+		TEXT("Removed Instance=%d Remaining=%d"),
+		InstanceIndex,
+		GeneratedCount);
+
+	return true;
 }
