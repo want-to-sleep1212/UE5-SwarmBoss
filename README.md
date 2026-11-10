@@ -44,7 +44,7 @@ git lfs pull
 | `Source/SwarmBoss/Swarm/SwarmShapePreview.h/.cpp` | ISM 기반 미리보기 Actor |
 | `Source/SwarmBoss/Swarm/SwarmShapeSamplerTests.cpp` | Unreal Automation 테스트 |
 
-그 외 First Person·Shooter·Horror 관련 소스와 콘텐츠는 프로젝트 템플릿 기반 구성입니다. 군체 생성 구현과 구분하여 유지하고 있습니다.
+그 외 First Person·Shooter·Horror 관련 C++ 소스는 프로젝트 템플릿 기반 구성입니다. 콘텐츠는 현재 FirstPerson 데모에서 재귀 참조하는 86개 에셋만 포함하며, 미사용 Shooter·Horror 레벨은 포함하지 않습니다. 군체 생성 구현과 템플릿 코드를 구분하여 유지합니다.
 
 ## 검증
 
@@ -68,5 +68,6 @@ git lfs pull
 
 - [1단계 사용 방법 및 검증 기록](Docs/Stage1README.md)
 - [전체 설계안](SwarmBossDesign.md)
+- [데모 에셋 추적 범위와 검증](Docs/DemoAssets.md)
 
 Android File Server의 로컬 인증 토큰은 공개 설정에 포함하지 않습니다. 해당 기능을 사용할 경우 개발 환경에서 별도로 설정해야 합니다.
