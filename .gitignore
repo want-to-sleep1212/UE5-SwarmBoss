@@ -1,0 +1,41 @@
+# Unreal generated output (also applies inside plugins)
+Binaries/
+DerivedDataCache/
+Intermediate/
+Saved/
+
+# IDE-generated workspace and project files
+.vs/
+.idea/
+.vscode/
+*.sln
+*.slnx
+*.suo
+*.opensdf
+*.sdf
+*.VC.db
+*.VC.opendb
+*.vcxproj
+*.vcxproj.filters
+*.vcxproj.user
+*.code-workspace
+
+# Local-only editor content
+/Content/Developers/
+/Content/Collections/
+
+# Local credentials and machine configuration
+.env
+.env.*
+!.env.example
+*.pfx
+*.p12
+*.pem
+*.key
+/Config/User*.ini
+/Config/DefaultEditorPerProjectUserSettings.ini
+
+# OS files
+.DS_Store
+Thumbs.db
+Desktop.ini
