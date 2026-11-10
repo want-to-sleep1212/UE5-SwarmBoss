@@ -1,3 +1,9 @@
+// SwarmShapePreview.h
+// 1단계 배치 실험용 Actor(ASwarmShapePreview) 선언.
+// 레벨에 배치한 뒤 Details에서 Settings를 조정하고 에디터 버튼(Generate/Clear Preview, Show Bounds)으로
+// 샘플러 결과를 Instanced Static Mesh 구체로 확인한다. 결과 보고(LastReport 등)를 읽기 전용으로 노출한다.
+// 이동·피격·재분배·형태 전환은 포함하지 않는다.
+
 #pragma once
 
 #include "CoreMinimal.h"

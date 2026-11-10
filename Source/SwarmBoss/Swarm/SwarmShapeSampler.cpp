@@ -1,3 +1,11 @@
+// SwarmShapeSampler.cpp
+// FSwarmShapeSampler 구현.
+// - GenerateTargets(): 설정 검증 → 필요 부피 V = N·d³/k로 도형 크기 계산 → Bridson 방식 샘플링
+//   (활성점, d~2d 구각 후보, 셀 크기 d 격자의 27셀 이웃 검사) → 영역 전체를 채운 뒤 N개를 무작위 부분 선택 → 검증.
+//   개수가 부족하면 MaxExpansionRatio 안에서 영역을 넓혀 재시도하고, 후보 검사 예산을 넘으면 즉시 실패한다.
+// - Contains(): 점이 구·박스 중심 허용 영역 안에 있는지 판정한다.
+// - ValidateTargets(): 경계와 최소 간격을 O(N²) 전수 검사로 독립 검증한다(생성 시 1회, 매 프레임 사용 금지).
+
 #include "SwarmShapeSampler.h"
 
 #include "HAL/PlatformTime.h"
@@ -15,6 +23,7 @@ namespace
 		const double Z = Random.FRandRange(-1.0f, 1.0f);
 		const double Angle = Random.FRand() * 2.0 * PI;
 		const double R = FMath::Sqrt(FMath::Max(0.0, 1.0 - Z * Z));
+
 		return FVector(R * FMath::Cos(Angle), R * FMath::Sin(Angle), Z);
 	}
 
@@ -24,6 +33,7 @@ namespace
 		// 셀 한 변을 d로 두고 인접 27셀을 검사한다. 셀에는 여러 점이 들어갈 수 있다.
 		TMap<FIntVector, TArray<int32>> Grid;
 		TArray<int32> Active;
+
 		auto Add = [&](const FVector& Point)
 		{
 			const int32 Index = Points.Add(Point);
@@ -42,11 +52,13 @@ namespace
 				Random.FRandRange(-1.f, 1.f)) * Extents;
 		}
 		Add(First);
+
 		while (!Active.IsEmpty())
 		{
 			const int32 ActiveSlot = Random.RandRange(0, Active.Num() - 1);
 			const FVector Origin = Points[Active[ActiveSlot]];
 			bool bAdded = false;
+
 			for (int32 CandidateIndex = 0; CandidateIndex < Settings.CandidatesPerPoint; ++CandidateIndex)
 			{
 				if (Tests >= Settings.MaxCandidateTests)
@@ -54,6 +66,7 @@ namespace
 					return false;
 				}
 				++Tests;
+
 				// d~2d 구각의 부피에 대해 균일한 반지름 분포.
 				const double Radius = Distance * FMath::Pow(1.0 + 7.0 * Random.FRand(), 1.0 / 3.0);
 				const FVector Candidate = Origin + RandomDirection(Random) * Radius;
@@ -61,6 +74,7 @@ namespace
 				{
 					continue;
 				}
+
 				const FIntVector Cell = CellFor(Candidate, Distance);
 				bool bSeparated = true;
 				for (int32 X = -1; X <= 1 && bSeparated; ++X)
@@ -79,6 +93,7 @@ namespace
 						}
 					}
 				}
+
 				if (bSeparated)
 				{
 					Add(Candidate);
@@ -86,11 +101,13 @@ namespace
 					break;
 				}
 			}
+
 			if (!bAdded)
 			{
 				Active.RemoveAtSwap(ActiveSlot, 1, EAllowShrinking::No);
 			}
 		}
+
 		return true;
 	}
 }
@@ -101,10 +118,12 @@ bool FSwarmShapeSampler::Contains(const FVector& Point, ESwarmPrimitive Shape, c
 	{
 		return false;
 	}
+
 	if (Shape == ESwarmPrimitive::Sphere)
 	{
 		return Point.SizeSquared() <= HalfExtents.X * HalfExtents.X;
 	}
+
 	return FMath::Abs(Point.X) <= HalfExtents.X && FMath::Abs(Point.Y) <= HalfExtents.Y
 		&& FMath::Abs(Point.Z) <= HalfExtents.Z;
 }
@@ -115,22 +134,26 @@ bool FSwarmShapeSampler::ValidateTargets(const TArray<FVector>& Points, ESwarmPr
 	// 1단계 검증용 독립 전수 검사. 매 프레임 실행하지 않는다.
 	OutMeasuredMinimum = 0.0;
 	double MinSquared = TNumericLimits<double>::Max();
+
 	for (int32 I = 0; I < Points.Num(); ++I)
 	{
 		if (!Contains(Points[I], Shape, HalfExtents))
 		{
 			return false;
 		}
+
 		for (int32 J = 0; J < I; ++J)
 		{
 			MinSquared = FMath::Min(MinSquared, FVector::DistSquared(Points[I], Points[J]));
 		}
 	}
+
 	if (Points.Num() > 1)
 	{
 		OutMeasuredMinimum = FMath::Sqrt(MinSquared);
 		return OutMeasuredMinimum + 1.e-6 >= MinimumDistance;
 	}
+
 	return true;
 }
 
@@ -138,12 +161,14 @@ FSwarmSamplingResult FSwarmShapeSampler::GenerateTargets(const FSwarmSamplingSet
 {
 	FSwarmSamplingResult Result;
 	const double Start = FPlatformTime::Seconds();
+
 	auto Finish = [&](const FString& Message)
 	{
 		Result.Message = Message;
 		Result.ElapsedMilliseconds = (FPlatformTime::Seconds() - Start) * 1000.0;
 		return Result;
 	};
+
 	if (S.ParticleCount < 0 || S.ParticleCount > 10000 || !FMath::IsFinite(S.ParticleRadius)
 		|| S.ParticleRadius < 0.01f || !FMath::IsFinite(S.SpacingMargin) || S.SpacingMargin < 0
 		|| !FMath::IsFinite(S.PackingCoefficient) || S.PackingCoefficient < 0.01f || S.PackingCoefficient > 10.f
@@ -155,12 +180,14 @@ FSwarmSamplingResult FSwarmShapeSampler::GenerateTargets(const FSwarmSamplingSet
 	{
 		return Finish(TEXT("Invalid sampling settings."));
 	}
+
 	Result.MinimumDistance = 2.0 * S.ParticleRadius + S.SpacingMargin;
 	if (S.ParticleCount == 0)
 	{
 		Result.bSuccess = true;
 		return Finish(TEXT("Empty shape."));
 	}
+
 	const double Volume = S.ParticleCount * FMath::Pow(Result.MinimumDistance, 3.0) / S.PackingCoefficient;
 	FVector InitialExtents;
 	if (S.Shape == ESwarmPrimitive::Sphere)
@@ -174,11 +201,13 @@ FSwarmSamplingResult FSwarmShapeSampler::GenerateTargets(const FSwarmSamplingSet
 		const double Scale = FMath::Pow(Volume / (8.0 * Ratio.X * Ratio.Y * Ratio.Z), 1.0 / 3.0);
 		InitialExtents = Ratio * Scale;
 	}
+
 	if (InitialExtents.ContainsNaN() || InitialExtents.GetMax() > 1.e8 || InitialExtents.GetMin() <= 0
 		|| InitialExtents.GetMax() / Result.MinimumDistance > 1.e6)
 	{
 		return Finish(TEXT("Shape dimensions exceed supported range."));
 	}
+
 	for (int32 Attempt = 0; Attempt < S.MaxAttempts; ++Attempt)
 	{
 		Result.Attempts = Attempt + 1;
@@ -186,6 +215,7 @@ FSwarmSamplingResult FSwarmShapeSampler::GenerateTargets(const FSwarmSamplingSet
 		Result.HalfExtents = InitialExtents * (1.0 + Result.ExpansionRatio);
 		Result.Points.Reset();
 		FRandomStream Random(static_cast<int32>(uint32(S.Seed) + uint32(Attempt) * 196613u));
+
 		if (S.ParticleCount == 1)
 		{
 			Result.Points.Add(FVector::ZeroVector);
@@ -195,6 +225,7 @@ FSwarmSamplingResult FSwarmShapeSampler::GenerateTargets(const FSwarmSamplingSet
 		{
 			return Finish(TEXT("Candidate budget exhausted; no result committed."));
 		}
+
 		if (Result.Points.Num() >= S.ParticleCount)
 		{
 			// N개에서 즉시 중단하면 시작점 주변만 채워진다. 영역을 샘플링한 뒤 균일하게 부분 선택한다.
@@ -203,10 +234,12 @@ FSwarmSamplingResult FSwarmShapeSampler::GenerateTargets(const FSwarmSamplingSet
 				Result.Points.Swap(I, Random.RandRange(I, Result.Points.Num() - 1));
 			}
 			Result.Points.SetNum(S.ParticleCount, EAllowShrinking::No);
+
 			Result.bSuccess = ValidateTargets(Result.Points, S.Shape, Result.HalfExtents,
 				Result.MinimumDistance, Result.MeasuredMinimumDistance);
 			return Finish(Result.bSuccess ? TEXT("Success.") : TEXT("Target validation failed."));
 		}
 	}
+
 	return Finish(TEXT("Not enough points within expansion limit; no result committed."));
 }
