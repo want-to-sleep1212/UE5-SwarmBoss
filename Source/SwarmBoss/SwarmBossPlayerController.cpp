@@ -5,6 +5,7 @@
 
 #include "Components/InputComponent.h"
 #include "Engine/World.h"
+#include "EngineUtils.h"
 #include "SwarmCrosshairHUD.h"
 #include "InputCoreTypes.h"
 #include "Swarm/SwarmShapePreview.h"
@@ -66,6 +67,18 @@ void ASwarmBossPlayerController::SetupInputComponent()
 			IE_Pressed,
 			this,
 			&ASwarmBossPlayerController::TraceSwarmParticle);
+
+		InputComponent->BindKey(
+			EKeys::T,
+			IE_Pressed,
+			this,
+			&ASwarmBossPlayerController::MoveSwarmParticlesForPreview);
+
+		InputComponent->BindKey(
+			EKeys::R,
+			IE_Pressed,
+			this,
+			&ASwarmBossPlayerController::ReconstructSwarmForPreview);
 	}
 
 
@@ -145,5 +158,37 @@ void ASwarmBossPlayerController::TraceSwarmParticle()
 			TEXT("Swarm trace: invalid preview or instance. Actor=%s Instance=%d"),
 			*GetNameSafe(Hit.GetActor()),
 			Hit.Item);
+	}
+}
+
+void ASwarmBossPlayerController::MoveSwarmParticlesForPreview()
+{
+	UWorld* World = GetWorld();
+
+	if (!World)
+	{
+		return;
+	}
+
+	const FVector LocalOffset(1000.0, 0.0, 0.0);
+
+	for (TActorIterator<ASwarmShapePreview> Preview(World); Preview; ++Preview)
+	{
+		Preview->OffsetActiveParticleTargets(LocalOffset);
+	}
+}
+
+void ASwarmBossPlayerController::ReconstructSwarmForPreview()
+{
+	UWorld* World = GetWorld();
+
+	if (!World)
+	{
+		return;
+	}
+
+	for (TActorIterator<ASwarmShapePreview> Preview(World); Preview; ++Preview)
+	{
+		Preview->ReconstructPreview();
 	}
 }

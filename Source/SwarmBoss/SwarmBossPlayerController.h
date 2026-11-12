@@ -55,6 +55,12 @@ protected:
 	// 왼쪽 클릭으로 화면 중앙의 구체 하나를 제거한다. 조준선은 HUD가 표시한다.
 	void TraceSwarmParticle();
 
+	// T 키로 활성 구체의 목표 이동을 확인한다.
+	void MoveSwarmParticlesForPreview();
+
+	// R 키로 살아 있는 구체의 재구성을 시작한다.
+	void ReconstructSwarmForPreview();
+
 	/** Returns true if the player should use UMG touch controls */
 	bool ShouldUseTouchControls() const;
 };

@@ -132,10 +132,52 @@ bool FSwarmPreviewTest::RunTest(const FString& Parameters)
 	ASwarmShapePreview* Preview = World->SpawnActor<ASwarmShapePreview>();
 	if (TestNotNull(TEXT("Preview actor"), Preview))
 	{
+		auto CheckInstanceMappings = [&]()
+		{
+			const int32 Count = Preview->Instances->GetInstanceCount();
+
+			int32 ActiveCount = 0;
+			TestEqual(TEXT("Reverse mapping count matches instances"), Preview->InstanceToParticle.Num(), Count);
+
+			for (int32 ParticleId = 0; ParticleId < Preview->Particles.Num(); ++ParticleId)
+			{
+				const FSwarmParticle& Particle = Preview->Particles[ParticleId];
+
+				if (!Particle.bActive)
+				{
+					TestEqual(TEXT("Inactive particle has no instance"), Particle.InstanceIndex, INDEX_NONE);
+					continue;
+				}
+
+				++ActiveCount;
+
+				if (!TestTrue(TEXT("Instance index has a reverse entry"),
+					Preview->InstanceToParticle.IsValidIndex(Particle.InstanceIndex)))
+				{
+					continue;
+				}
+
+				TestEqual(TEXT("Reverse entry resolves the same particle"),
+					Preview->InstanceToParticle[Particle.InstanceIndex], ParticleId);
+
+				FTransform LocalTransform;
+				if (TestTrue(TEXT("Mapped instance exists"),
+					Preview->Instances->GetInstanceTransform(Particle.InstanceIndex, LocalTransform, false)))
+				{
+					TestTrue(TEXT("Mapped instance is at the particle position"),
+						LocalTransform.GetLocation().Equals(Particle.LocalPosition, 1.e-4));
+				}
+			}
+
+			TestEqual(TEXT("Active particle count matches instances"), ActiveCount, Count);
+			TestEqual(TEXT("ActiveParticleCount matches live slots"), Preview->ActiveParticleCount, ActiveCount);
+		};
+
 		Preview->Settings.ParticleCount = 50;
 		Preview->GeneratePreview();
 		TestTrue(TEXT("Engine sphere mesh loaded"), Preview->Instances->GetStaticMesh() != nullptr);
 		TestEqual(TEXT("Rendered instance count"), Preview->Instances->GetInstanceCount(), 50);
+		CheckInstanceMappings();
 
 		FTransform Instance;
 		TestTrue(TEXT("Instance transform exists"), Preview->Instances->GetInstanceTransform(0, Instance, false));
@@ -156,14 +198,112 @@ bool FSwarmPreviewTest::RunTest(const FString& Parameters)
 		AddExpectedError(TEXT("Invalid sampling settings."), EAutomationExpectedErrorFlags::Contains, 1);
 		Preview->GeneratePreview();
 		TestEqual(TEXT("Failure retains previous preview"), Preview->Instances->GetInstanceCount(), PreviousCount);
+		CheckInstanceMappings();
+
+		// 중간 번호를 지워 실제로 마지막 구체의 번호가 바뀌는 경우를 확인한다.
+		const int32 MiddleIndex = PreviousCount / 2;
+		const int32 RemovedParticleId = Preview->InstanceToParticle[MiddleIndex];
+		const int32 MovedParticleId = Preview->InstanceToParticle.Last();
+
+		TestTrue(TEXT("Middle instance removed"), Preview->RemoveInstance(Preview->Instances.Get(), MiddleIndex));
+		TestFalse(TEXT("Removed particle is inactive"), Preview->Particles[RemovedParticleId].bActive);
+		TestEqual(TEXT("Particle slots are preserved"), Preview->Particles.Num(), PreviousCount);
+		TestEqual(TEXT("Last particle fills the gap"), Preview->InstanceToParticle[MiddleIndex], MovedParticleId);
+		CheckInstanceMappings();
+
+		Preview->Settings.SpacingMargin = 2;
+
+		const FVector OriginalTarget = Preview->Particles[MovedParticleId].TargetLocalPosition;
+		const FSwarmSamplingResult Reconstruction = Preview->GenerateReconstructionTargets();
+
+		TestTrue(TEXT("Reconstruction samples surviving particles"), Reconstruction.bSuccess);
+		TestEqual(TEXT("Reconstruction produces one target per survivor"), Reconstruction.Points.Num(), PreviousCount - 1);
+		TestEqual(TEXT("Reconstruction preserves initial generation count"), Preview->Settings.ParticleCount, PreviousCount);
+		TestTrue(TEXT("Sampling leaves the particle target unchanged"),
+			Preview->Particles[MovedParticleId].TargetLocalPosition.Equals(OriginalTarget));
+		CheckInstanceMappings();
+
+		// 교환 삭제로 번호가 바뀐 개체에 목표를 배정한다.
+		const FVector Start = Preview->Particles[MovedParticleId].LocalPosition;
+		const FVector Target = Start + FVector(100, 0, 0);
+
+		TestFalse(TEXT("Tick starts disabled"), Preview->IsActorTickEnabled());
+		TestFalse(TEXT("Inactive particle cannot receive a target"), Preview->AssignParticleTarget(RemovedParticleId, Target));
+		TestTrue(TEXT("Moved particle receives a target"), Preview->AssignParticleTarget(MovedParticleId, Target));
+		TestTrue(TEXT("Target assignment enables Tick"), Preview->IsActorTickEnabled());
+
+		Preview->Tick(0.25f);
+		TestTrue(TEXT("Particle moves at a constant speed"),
+			Preview->Particles[MovedParticleId].LocalPosition.Equals(Start + FVector(50, 0, 0), 1.e-4));
+		TestTrue(TEXT("Tick stays enabled while moving"), Preview->IsActorTickEnabled());
+		CheckInstanceMappings();
+
+		Preview->Tick(1.0f);
+		TestTrue(TEXT("Particle stops at target without overshooting"),
+			Preview->Particles[MovedParticleId].LocalPosition.Equals(Target, 1.e-4));
+		TestFalse(TEXT("Arrival disables Tick"), Preview->IsActorTickEnabled());
+		CheckInstanceMappings();
+
+		const FVector InactiveTarget = Preview->Particles[RemovedParticleId].TargetLocalPosition;
+
+		TestFalse(TEXT("Wrong target count is rejected"), Preview->AssignReconstructionTargets({}));
+		TestFalse(TEXT("Rejected assignment leaves Tick disabled"), Preview->IsActorTickEnabled());
+
+		if (TestTrue(TEXT("Reconstruction targets are assigned"), Preview->AssignReconstructionTargets(Reconstruction.Points)))
+		{
+			int32 TargetIndex = 0;
+			for (const FSwarmParticle& Particle : Preview->Particles)
+			{
+				if (Particle.bActive)
+				{
+					TestTrue(TEXT("Active particles receive targets in slot order"),
+						Particle.TargetLocalPosition.Equals(Reconstruction.Points[TargetIndex]));
+					++TargetIndex;
+				}
+			}
+		}
+
+		TestTrue(TEXT("Inactive particle keeps its target"),
+			Preview->Particles[RemovedParticleId].TargetLocalPosition.Equals(InactiveTarget));
+		CheckInstanceMappings();
+
+		const FVector InitialHalfExtents = Preview->AppliedHalfExtents;
+
+		for (int32 Index = Preview->Instances->GetInstanceCount() - 1; Index >= 14; --Index)
+		{
+			TestTrue(TEXT("Remove instance before reconstruction"), Preview->RemoveInstance(Preview->Instances.Get(), Index));
+		}
+
+		if (TestTrue(TEXT("Reconstruct 14 survivors"), Preview->ReconstructPreview()))
+		{
+			TestEqual(TEXT("Reconstruction preserves 14 live instances"), Preview->Instances->GetInstanceCount(), 14);
+			TestTrue(TEXT("Displayed bounds shrink with the new target layout"),
+				Preview->AppliedHalfExtents.GetMax() < InitialHalfExtents.GetMax());
+
+			Preview->Tick(10.0f);
+			TestFalse(TEXT("Survivors reach their reconstruction targets"), Preview->IsActorTickEnabled());
+
+			for (const FSwarmParticle& Particle : Preview->Particles)
+			{
+				if (Particle.bActive)
+				{
+					TestTrue(TEXT("Reconstructed particle lies inside the new bounds"), FSwarmShapeSampler::Contains(
+						Particle.LocalPosition, Preview->Settings.Shape, Preview->AppliedHalfExtents));
+				}
+			}
+
+			CheckInstanceMappings();
+		}
 
 		Preview->ClearPreview();
 		TestEqual(TEXT("Clear removes all instances"), Preview->Instances->GetInstanceCount(), 0);
+		CheckInstanceMappings();
 
 		// 이동·회전된 Actor의 단일 구체를 엔진 Object Trace로 식별한다.
 		Preview->Settings.SpacingMargin = 2;
 		Preview->Settings.ParticleCount = 1;
 		Preview->GeneratePreview();
+		CheckInstanceMappings();
 
 		FCollisionObjectQueryParams ObjectQuery;
 		ObjectQuery.AddObjectTypesToQuery(ECC_GameTraceChannel3);
@@ -188,8 +328,13 @@ bool FSwarmPreviewTest::RunTest(const FString& Parameters)
 
 		TestTrue(TEXT("Hit instance removed"), Preview->RemoveInstance(Hit.GetComponent(), Hit.Item));
 		TestEqual(TEXT("No instance remains"), Preview->Instances->GetInstanceCount(), 0);
-		TestEqual(TEXT("GeneratedCount follows actual instances"), Preview->GeneratedCount, 0);
+		TestEqual(TEXT("No active particle remains"), Preview->ActiveParticleCount, 0);
+
+		const FSwarmSamplingResult EmptyReconstruction = Preview->GenerateReconstructionTargets();
+		TestTrue(TEXT("No survivors produce an empty target list"),
+			EmptyReconstruction.bSuccess && EmptyReconstruction.Points.IsEmpty());
 		TestEqual(TEXT("Regeneration setting preserved"), Preview->Settings.ParticleCount, 1);
+		CheckInstanceMappings();
 
 		FHitResult HitAfterRemoval;
 		TestFalse(TEXT("Removed sphere no longer collides"), World->LineTraceSingleByObjectType(

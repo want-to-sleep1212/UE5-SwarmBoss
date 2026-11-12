@@ -19,7 +19,8 @@ DEFINE_LOG_CATEGORY_STATIC(LogSwarmShape, Log, All);
 
 ASwarmShapePreview::ASwarmShapePreview()
 {
-	PrimaryActorTick.bCanEverTick = false;
+	PrimaryActorTick.bCanEverTick = true;
+	PrimaryActorTick.bStartWithTickEnabled = false;
 
 	Instances = CreateDefaultSubobject<UInstancedStaticMeshComponent>(TEXT("Particles"));
 	SetRootComponent(Instances);
@@ -27,6 +28,7 @@ ASwarmShapePreview::ASwarmShapePreview()
 	Instances->SetMobility(EComponentMobility::Movable);
 	Instances->SetCollisionProfileName(TEXT("SwarmSpherePreset"));
 	Instances->SetCanEverAffectNavigation(false);
+	Instances->SetRemoveSwap();
 
 	static ConstructorHelpers::FObjectFinder<UStaticMesh> Sphere(TEXT("/Engine/BasicShapes/Sphere.Sphere"));
 	if (Sphere.Succeeded())
@@ -50,6 +52,16 @@ void ASwarmShapePreview::BeginPlay()
 	GeneratePreview();
 }
 
+void ASwarmShapePreview::Tick(float DeltaTime)
+{
+	Super::Tick(DeltaTime);
+
+	if (!UpdateParticleMovement(DeltaTime))
+	{
+		SetActorTickEnabled(false);
+	}
+}
+
 void ASwarmShapePreview::GeneratePreview()
 {
 	const FSwarmSamplingResult Result = FSwarmShapeSampler::GenerateTargets(Settings);
@@ -66,42 +78,147 @@ void ASwarmShapePreview::GeneratePreview()
 	Modify();
 	Instances->Modify();
 
+	SetActorTickEnabled(false);
+
+	Particles.Reset(Result.Points.Num());
+
 	TArray<FTransform> Transforms;
 	Transforms.Reserve(Result.Points.Num());
+
 	// Engine BasicShapes/Sphere는 반지름 50cm이다. 목표 도형 크기와 무관하게 고정한다.
 	const FVector ParticleScale(Settings.ParticleRadius / 50.0);
+
 	for (const FVector& Point : Result.Points)
 	{
-		Transforms.Emplace(FQuat::Identity, Point, ParticleScale);
+		FSwarmParticle& Particle = Particles.AddDefaulted_GetRef();
+		Particle.LocalPosition = Point;
+		Particle.TargetLocalPosition = Particle.LocalPosition;
+
+		Transforms.Emplace(FQuat::Identity, Particle.LocalPosition, ParticleScale);
 	}
 
 	Instances->ClearInstances();
 	// 기존 레벨에 NoCollision으로 저장된 Actor도 재생성하면 새 프리셋을 적용한다.
 	Instances->SetCollisionProfileName(TEXT("SwarmSpherePreset"));
-	Instances->AddInstances(Transforms, false, false, false);
 
-	GeneratedCount = Result.Points.Num();
+	const TArray<int32> NewInstanceIndices = Instances->AddInstances(
+		Transforms,
+		/*bShouldReturnIndices=*/true,
+		/*bWorldSpace=*/false,
+		/*bUpdateNavigation=*/false);
+
+	InstanceToParticle.Init(INDEX_NONE, Instances->GetInstanceCount());
+
+	// 반환된 번호는 Transforms와 같은 순서다. 개체 ID는 Particles의 슬롯 번호다.
+	for (int32 ParticleId = 0; ParticleId < NewInstanceIndices.Num(); ++ParticleId)
+	{
+		const int32 InstanceIndex = NewInstanceIndices[ParticleId];
+
+		Particles[ParticleId].InstanceIndex = InstanceIndex;
+		InstanceToParticle[InstanceIndex] = ParticleId;
+	}
+
+	ActiveParticleCount = Particles.Num();
 	AppliedHalfExtents = Result.HalfExtents;
 	AppliedShape = Settings.Shape;
 
 	UE_LOG(LogSwarmShape, Display, TEXT("%s"), *LastReport);
 }
 
+FSwarmSamplingResult ASwarmShapePreview::GenerateReconstructionTargets() const
+{
+	FSwarmSamplingSettings ReconstructionSettings = Settings;
+	ReconstructionSettings.ParticleCount = ActiveParticleCount;
+
+	return FSwarmShapeSampler::GenerateTargets(ReconstructionSettings);
+}
+
+bool ASwarmShapePreview::AssignReconstructionTargets(const TArray<FVector>& Targets)
+{
+	if (Targets.Num() != ActiveParticleCount)
+	{
+		return false;
+	}
+
+	// 하나라도 잘못된 좌표가 있으면 기존 목표를 그대로 둔다.
+	for (const FVector& Target : Targets)
+	{
+		if (Target.ContainsNaN())
+		{
+			return false;
+		}
+	}
+
+	int32 TargetIndex = 0;
+
+	for (int32 ParticleId = 0; ParticleId < Particles.Num(); ++ParticleId)
+	{
+		if (!Particles[ParticleId].bActive)
+		{
+			continue;
+		}
+
+		AssignParticleTarget(ParticleId, Targets[TargetIndex]);
+		++TargetIndex;
+	}
+
+	return true;
+}
+
+bool ASwarmShapePreview::ReconstructPreview()
+{
+	const FSwarmSamplingResult Result = GenerateReconstructionTargets();
+
+	if (!Result.bSuccess)
+	{
+		UE_LOG(LogSwarmShape, Warning, TEXT("Swarm reconstruction sampling failed for %s: %s"),
+			*GetName(), *Result.Message);
+		return false;
+	}
+
+	if (!AssignReconstructionTargets(Result.Points))
+	{
+		UE_LOG(LogSwarmShape, Warning, TEXT("Swarm reconstruction targets were rejected for %s."),
+			*GetName());
+		return false;
+	}
+
+	const FVector PreviousHalfExtents = AppliedHalfExtents;
+
+	AppliedHalfExtents = Result.HalfExtents;
+	AppliedShape = Settings.Shape;
+
+	LastReport = FString::Printf(
+		TEXT("Reconstruction Active=%d HalfExtents(cm): %s -> %s Expansion=%.2f%%"),
+		ActiveParticleCount,
+		*PreviousHalfExtents.ToString(),
+		*AppliedHalfExtents.ToString(),
+		Result.ExpansionRatio * 100.0);
+
+	UE_LOG(LogSwarmShape, Display, TEXT("%s: %s"), *GetName(), *LastReport);
+
+	return true;
+}
+
 void ASwarmShapePreview::ClearPreview()
 {
+	SetActorTickEnabled(false);
+
 	Modify();
 	Instances->Modify();
 
 	Instances->ClearInstances();
+	Particles.Reset();
+	InstanceToParticle.Reset();
 
-	GeneratedCount = 0;
+	ActiveParticleCount = 0;
 	AppliedHalfExtents = FVector::ZeroVector;
 	LastReport = TEXT("Preview cleared.");
 }
 
 void ASwarmShapePreview::ShowBounds()
 {
-	if (!GetWorld() || GeneratedCount == 0)
+	if (!GetWorld() || Instances->GetInstanceCount() == 0)
 	{
 		return;
 	}
@@ -152,22 +269,129 @@ bool ASwarmShapePreview::RemoveInstance(const UPrimitiveComponent* HitComponent,
 		return false;
 	}
 
-	if (InstanceIndex < 0 || InstanceIndex >= Instances->GetInstanceCount())
+	if (InstanceToParticle.Num() != Instances->GetInstanceCount()
+		|| !InstanceToParticle.IsValidIndex(InstanceIndex))
 	{
 		return false;
 	}
+
+	const int32 RemovedParticleId = InstanceToParticle[InstanceIndex];
+	const int32 LastInstanceIndex = InstanceToParticle.Num() - 1;
+	const int32 LastParticleId = InstanceToParticle[LastInstanceIndex];
 
 	if (!Instances->RemoveInstance(InstanceIndex))
 	{
 		return false;
 	}
 
-	GeneratedCount = Instances->GetInstanceCount();
+	FSwarmParticle& RemovedParticle = Particles[RemovedParticleId];
+	RemovedParticle.bActive = false;
+	RemovedParticle.InstanceIndex = INDEX_NONE;
+
+	// ISM과 같은 방식으로 마지막 항목을 삭제한 자리에 옮긴다.
+	InstanceToParticle.RemoveAtSwap(InstanceIndex, EAllowShrinking::No);
+
+	if (InstanceIndex != LastInstanceIndex)
+	{
+		Particles[LastParticleId].InstanceIndex = InstanceIndex;
+	}
+
+	--ActiveParticleCount;
 
 	UE_LOG(LogSwarmShape, Display,
 		TEXT("Removed Instance=%d Remaining=%d"),
 		InstanceIndex,
-		GeneratedCount);
+		ActiveParticleCount);
 
 	return true;
+}
+
+bool ASwarmShapePreview::AssignParticleTarget(int32 ParticleId, const FVector& TargetLocalPosition)
+{
+	if (!Particles.IsValidIndex(ParticleId) || TargetLocalPosition.ContainsNaN())
+	{
+		return false;
+	}
+
+	FSwarmParticle& Particle = Particles[ParticleId];
+
+	if (!Particle.bActive)
+	{
+		return false;
+	}
+
+	Particle.TargetLocalPosition = TargetLocalPosition;
+
+	if (Particle.LocalPosition != TargetLocalPosition)
+	{
+		SetActorTickEnabled(true);
+	}
+
+	return true;
+}
+
+void ASwarmShapePreview::OffsetActiveParticleTargets(const FVector& LocalOffset)
+{
+	for (int32 ParticleId = 0; ParticleId < Particles.Num(); ++ParticleId)
+	{
+		const FSwarmParticle& Particle = Particles[ParticleId];
+
+		if (Particle.bActive)
+		{
+			AssignParticleTarget(ParticleId, Particle.LocalPosition + LocalOffset);
+		}
+	}
+}
+
+bool ASwarmShapePreview::UpdateParticleMovement(float DeltaTime)
+{
+	if (!IsValid(Instances))
+	{
+		return false;
+	}
+
+	constexpr float MoveSpeed = 200.0f; // cm/s
+	bool bTransformsChanged = false;
+	bool bHasMovingParticles = false;
+
+	for (FSwarmParticle& Particle : Particles)
+	{
+		if (!Particle.bActive || Particle.LocalPosition == Particle.TargetLocalPosition)
+		{
+			continue;
+		}
+
+		FTransform InstanceTransform;
+		if (!Instances->GetInstanceTransform(Particle.InstanceIndex, InstanceTransform, false))
+		{
+			continue;
+		}
+
+		const FVector NextPosition = FMath::VInterpConstantTo(
+			Particle.LocalPosition,
+			Particle.TargetLocalPosition,
+			DeltaTime,
+			MoveSpeed);
+
+		InstanceTransform.SetLocation(NextPosition);
+
+		if (Instances->UpdateInstanceTransform(
+			Particle.InstanceIndex,
+			InstanceTransform,
+			/*bWorldSpace=*/false,
+			/*bMarkRenderStateDirty=*/false,
+			/*bTeleport=*/true))
+		{
+			Particle.LocalPosition = NextPosition;
+			bTransformsChanged = true;
+			bHasMovingParticles |= NextPosition != Particle.TargetLocalPosition;
+		}
+	}
+
+	if (bTransformsChanged)
+	{
+		Instances->MarkRenderStateDirty();
+	}
+
+	return bHasMovingParticles;
 }
