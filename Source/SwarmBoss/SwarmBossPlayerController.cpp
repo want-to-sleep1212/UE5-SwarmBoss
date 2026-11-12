@@ -8,6 +8,7 @@
 #include "EngineUtils.h"
 #include "SwarmCrosshairHUD.h"
 #include "InputCoreTypes.h"
+#include "Swarm/SwarmRuntimeComponent.h"
 #include "Swarm/SwarmShapePreview.h"
 
 #include "EnhancedInputSubsystems.h"
@@ -150,12 +151,15 @@ void ASwarmBossPlayerController::TraceSwarmParticle()
 		return;
 	}
 
-	ASwarmShapePreview* Preview = Cast<ASwarmShapePreview>(Hit.GetActor());
+	const AActor* HitActor = Hit.GetActor();
+	USwarmRuntimeComponent* SwarmRuntime = HitActor
+		? HitActor->FindComponentByClass<USwarmRuntimeComponent>()
+		: nullptr;
 
-	if (!Preview || !Preview->RemoveInstance(Hit.GetComponent(), Hit.Item))
+	if (!SwarmRuntime || !SwarmRuntime->RemoveInstance(Hit.GetComponent(), Hit.Item))
 	{
 		UE_LOG(LogSwarmBoss, Warning,
-			TEXT("Swarm trace: invalid preview or instance. Actor=%s Instance=%d"),
+			TEXT("Swarm trace: invalid runtime component or instance. Actor=%s Instance=%d"),
 			*GetNameSafe(Hit.GetActor()),
 			Hit.Item);
 	}
@@ -174,7 +178,7 @@ void ASwarmBossPlayerController::MoveSwarmParticlesForPreview()
 
 	for (TActorIterator<ASwarmShapePreview> Preview(World); Preview; ++Preview)
 	{
-		Preview->OffsetActiveParticleTargets(LocalOffset);
+		Preview->SwarmRuntime->OffsetActiveParticleTargets(LocalOffset);
 	}
 }
 

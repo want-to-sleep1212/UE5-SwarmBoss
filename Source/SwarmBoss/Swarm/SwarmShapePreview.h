@@ -13,18 +13,7 @@
 
 class UInstancedStaticMeshComponent;
 class UPrimitiveComponent;
-
-/** 생성한 구체 하나의 도형 기준 위치와 초기 활성 상태. */
-struct FSwarmParticle
-{
-	FVector LocalPosition = FVector::ZeroVector;
-
-	FVector TargetLocalPosition = FVector::ZeroVector;
-
-	bool bActive = true;
-
-	int32 InstanceIndex = INDEX_NONE;
-};
+class USwarmRuntimeComponent;
 
 /** 구체 배치, 목표 이동, 인스턴스 식별 실험용 Actor. */
 UCLASS()
@@ -36,17 +25,19 @@ public:
 	ASwarmShapePreview();
 	virtual void OnConstruction(const FTransform& Transform) override;
 
-	virtual void Tick(float DeltaTime) override;
-
 	UPROPERTY(EditAnywhere, Category="Swarm")
 	FSwarmSamplingSettings Settings;
 
 	UPROPERTY(VisibleAnywhere, Category="Swarm")
 	TObjectPtr<UInstancedStaticMeshComponent> Instances;
 
+	UPROPERTY(VisibleAnywhere, Category="Swarm")
+	TObjectPtr<USwarmRuntimeComponent> SwarmRuntime;
+
 	UPROPERTY(VisibleInstanceOnly, Category="Swarm|Result")
 	FString LastReport;
 
+	// Details 표시용 값. 게임 로직은 ParticleStore의 생존 개수를 사용한다.
 	UPROPERTY(VisibleInstanceOnly, Transient, Category="Swarm|Result")
 	int32 ActiveParticleCount = 0;
 
@@ -58,10 +49,8 @@ public:
 	void GeneratePreview();
 
 	// 생존 개수로 재구성에 사용할 목표 좌표를 계산한다.
+	// TODO: 군체 보스의 형태 제어 코드를 추가할 때 이 함수를 그쪽으로 옮긴다.
 	FSwarmSamplingResult GenerateReconstructionTargets() const;
-
-	// 개체 ID 순서대로 활성 구체에 재구성 목표를 하나씩 배정한다.
-	bool AssignReconstructionTargets(const TArray<FVector>& Targets);
 
 	// 생존 구체의 목표와 표시할 도형 경계를 함께 갱신한다.
 	bool ReconstructPreview();
@@ -75,31 +64,11 @@ public:
 	// 반환된 번호로 월드 위치를 다시 조회해 표시한다. 잘못된 대상·번호면 false.
 	bool HighlightInstance(const UPrimitiveComponent* HitComponent, int32 InstanceIndex);
 
-	// 맞힌 구체 하나를 제거하고 실제 남은 개수를 갱신한다.
-	bool RemoveInstance(const UPrimitiveComponent* HitComponent, int32 InstanceIndex);
-
-	// 지정한 활성 개체에 Actor 기준 목표 좌표를 배정하고 이동을 시작한다.
-	bool AssignParticleTarget(int32 ParticleId, const FVector& TargetLocalPosition);
-
-	// 활성 개체마다 현재 위치에 로컬 오프셋을 더한 좌표를 배정한다.
-	void OffsetActiveParticleTargets(const FVector& LocalOffset);
-
-
-
 protected:
 	virtual void BeginPlay() override;
 
 private:
-	friend class FSwarmPreviewTest;
-
-	// 한 프레임 이동한 뒤 아직 목표로 이동할 개체가 있는지 반환한다.
-	bool UpdateParticleMovement(float DeltaTime);
-
-	// 성공한 생성 결과를 담는다. 배열의 자리 번호가 개체 ID다.
-	TArray<FSwarmParticle> Particles;
-
-	// 현재 인스턴스 번호로 개체 ID를 찾는다.
-	TArray<int32> InstanceToParticle;
+	void UpdateDisplayedActiveParticleCount(int32 NewCount);
 
 	UPROPERTY()
 	ESwarmPrimitive AppliedShape = ESwarmPrimitive::Sphere;
