@@ -15,7 +15,7 @@ Unreal Engine 5와 C++로 개발하는 군체 보스 프로토타입입니다. �
 - 구·박스 내부 3D Poisson Disk Sampling, 최소 간격과 배치 계수에 따른 크기 계산.
 - 중앙 `FSwarmParticleStore`와 부위별 ISM, 안정적인 `ParticleId`와 인스턴스 번호의 양방향 연결.
 - 클릭한 구체의 교환 삭제, 생존 수 관리, 위치를 유지하는 부위 간 소속 이전.
-- `USwarmFormDefinition` Data Asset(`DA_GiantForm`)에서 부위 도형·비율·배분 가중치를 읽어 생성하고, 데이터 유효성을 검사.
+- `USwarmFormDefinition` Data Asset(`DA_GiantForm`)에서 부위 도형·비율·배분 가중치를 읽어 생성하고, 데이터 유효성을 검사. 부위 ISM도 데이터의 부위 목록대로 Play 시작 시 생성.
 - 데이터 가중치(현재 시험값 몸통:왼팔 10:1, 미확정)에 따른 재분배와 생존 수에 맞춘 목표 재생성·순차 배정.
 - 기본 0.8초의 이차 감속 이동. 에디터에서 `Reconstruction Duration` 수정 가능.
 - 표시 전용 `SwarmShapePreview`. 실제 피격·이동은 `SwarmBossManager`가 담당.

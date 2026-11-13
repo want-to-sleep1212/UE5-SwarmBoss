@@ -7,7 +7,7 @@
 
 ## 1. 작업 재개 지점
 
-**Manager는 `USwarmFormDefinition` Data Asset(`/Game/Data/DA_GiantForm`)을 읽어 몸통·왼팔을 생성하고, T 재분배도 같은 데이터의 가중치를 사용한다. 다음 작은 작업은 거인 전체 부위 추가다.** 거인 전체·검·변신을 한 번에 구현하지 않는다. 최근 대화에서 변신 구조를 먼저 검토한 이유는 이 데이터 구조를 나중에 크게 바꾸지 않기 위해서다.
+**Manager는 `USwarmFormDefinition` Data Asset(`/Game/Data/DA_GiantForm`)의 부위 목록대로 ISM을 만들어 구체를 생성하고, T 재분배도 같은 데이터의 가중치를 사용한다. 다음 작은 작업은 부모 기준 연결 위치 계산 방식을 정하는 것이다(7장 2단계의 두 번째 하위 단계).** 거인 전체·검·변신을 한 번에 구현하지 않는다. 최근 대화에서 변신 구조를 먼저 검토한 이유는 이 데이터 구조를 나중에 크게 바꾸지 않기 위해서다.
 
 읽을 순서:
 
@@ -15,7 +15,7 @@
 2. `Source/SwarmBoss/Swarm/SwarmParticleStore.h`: 구체 상태와 ID.
 3. `Source/SwarmBoss/Boss/SwarmFormDefinition.h`: 부위 구성 데이터 형식.
 4. `Source/SwarmBoss/Boss/SwarmBossManager.h`: 소유 데이터와 공개 기능.
-5. 같은 `.cpp`의 `GenerateInitialParts`, `ValidateFormDefinition`, `RemoveInstance`, `TransferParticle`, `RebalanceParts`, `RebalancePartsFromDefinition`, `UpdateParticleMovement`.
+5. 같은 `.cpp`의 `GenerateInitialParts`, `ValidateFormDefinition`, `SyncPartInstances`, `RemoveInstance`, `TransferParticle`, `RebalanceParts`, `RebalancePartsFromDefinition`, `UpdateParticleMovement`.
 6. `Source/SwarmBoss/SwarmBossPlayerController.cpp`: 실제 클릭/T 입력.
 7. `Source/SwarmBoss/Swarm/SwarmShapeSamplerTests.cpp`: 기존 동작의 검증 조건.
 
@@ -71,31 +71,34 @@ d = 2 × ParticleRadius + SpacingMargin
 ```text
 ASwarmBossManager
  ├─ FormDefinition: USwarmFormDefinition Data Asset 참조(DA_GiantForm)
+ ├─ SphereMesh: 모든 부위 ISM의 구체 메시(/Engine/BasicShapes/Sphere)
  ├─ FSwarmParticleStore
  │   ├─ Particles: 중앙 구체 배열, 슬롯 인덱스가 ParticleId
  │   └─ ActiveParticleCount: 전체 생존 수
- └─ Parts: TMap<ESwarmPartId, FSwarmPart>
-     ├─ Instances: 부위별 ISM
+ └─ Parts: TMap<ESwarmPartId, FSwarmPart>   마지막 생성 데이터의 부위 목록과 일치
+     ├─ Instances: 부위별 ISM(생성 시 동적 생성, 이름 "부위명Instances")
      ├─ InstanceToParticle: 해당 ISM 번호 → 중앙 ParticleId
      └─ SamplingSettings: 마지막 초기 생성에 성공한 설정
 ```
 
 `USwarmRuntimeComponent`의 생성·제거·위치 갱신·Tick은 Manager에 통합했다. `ASwarmShapePreview`는 독립적인 샘플링 표시 Actor로 충돌·중앙 저장소·게임플레이 입력을 담당하지 않는다.
 
-`FSwarmParticle`은 `LocalPosition`, `TargetLocalPosition`, `RemainingMoveTime`, `bActive`, `InstanceIndex`, `PartId`를 가진다. 위치·목표는 소속 부위 ISM 기준이다. enum은 `SwarmPartTypes.h`로 분리했고 거인의 머리·오른팔·양손·양다리·양발 및 None을 추가했다. 현재 Manager가 실제로 생성하는 부위는 여전히 몸통·왼팔뿐이다.
+`FSwarmParticle`은 `LocalPosition`, `TargetLocalPosition`, `RemainingMoveTime`, `bActive`, `InstanceIndex`, `PartId`를 가진다. 위치·목표는 소속 부위 ISM 기준이다. enum은 `SwarmPartTypes.h`로 분리했고 거인의 머리·오른팔·양손·양다리·양발 및 None을 추가했다. Manager는 데이터에 있는 부위를 모두 생성할 수 있지만, `DA_GiantForm`에는 아직 몸통·왼팔만 있다.
 
 ### 생성
 
-`BeginPlay → GenerateInitialParts → ValidateFormDefinition → AllocatePartCounts → GenerateTargets(각 부위) → InitializeParticles → ResetParticles → AddPartParticles → Store.AddParticles`.
+`BeginPlay → GenerateInitialParts → ValidateFormDefinition → AllocatePartCounts → GenerateTargets(각 부위) → SyncPartInstances → InitializeParticles → ResetParticles → AddPartParticles → Store.AddParticles → 부위 위치 배치`.
 
 - Manager Details `Swarm|Generation`의 `Form Definition`에 지정한 Data Asset을 읽는다. 비어 있으면 `FormDefinition is not assigned` 경고를 남기고 생성하지 않는다. 코드 기본값으로 대체 생성하지 않는다.
 - `InitialParticleCount` 기본 90, 에디터 범위 0~10000. 각 부위는 `전체 × AllocationWeight / 가중치 합`을 버림한 수를 받고, 버림 나머지는 `RemainderPartId`(몸통)가 받는다.
 - 부위의 도형·Box 비율은 데이터의 `Shape`, `BoxHalfExtentsRatio`를 쓴다. `DA_GiantForm`의 비율은 몸통 (1, 0.75, 1.5), 왼팔 (0.45, 0.45, 1)이다. 가중치는 이전 코드 상수 2:1로 시작했고 2026-11-14 현재 시험 중인 몸통:왼팔 10:1로 저장되어 있다. 확정값이 아니다.
-- 생성 전에 `ValidateFormDefinition`이 ID 중복·None/Preview, Manager ISM이 없는 부위·정의 누락, 음수 가중치·가중치 합 0, 비율·자세 값, 자기 부모·미정의 부모, 몸통 외 최상위 부위, 순환, 잔여 수신 부위를 검사한다. 실패 시 원인을 경고로 남기고 기존 구체를 유지한다. Clamp 메타데이터는 런타임 검증으로 간주하지 않는다.
-- Manager는 아직 몸통·왼팔 ISM만 만들므로 데이터에는 이 두 부위가 정확히 있어야 한다. 부위가 늘어나면 ISM 생성도 데이터 기반으로 바꿔야 한다.
+- 생성 전에 `ValidateFormDefinition`이 ID 중복·None/Preview, 음수 가중치·가중치 합 0, 비율·자세 값, 자기 부모·미정의 부모, 몸통 외 최상위 부위, 순환, 잔여 수신 부위를 검사한다. 실패 시 원인을 경고로 남기고 기존 구체를 유지한다. Clamp 메타데이터는 런타임 검증으로 간주하지 않는다.
+- 부위 ISM은 생성자에서 만들지 않는다(2026-11-14 변경). 모든 부위의 샘플링이 성공한 뒤 `SyncPartInstances`가 데이터 목록에 없는 부위의 ISM을 파괴하고, 새 부위의 ISM을 만들어 루트에 붙인 뒤 등록한다. 이미 있는 부위의 ISM은 재사용한다. 그래서 Play 전 에디터 Details에는 부위 ISM이 보이지 않는다. 부위 ISM은 `GetPartInstances(PartId)`로 조회한다.
+- ISM 이름은 `TorsoInstances`처럼 "부위명Instances"이다. 파괴 직후 같은 이름이 남아 있으면 번호가 붙을 수 있으므로 이름으로 부위를 찾지 않는다.
 - 모든 부위의 샘플링 결과가 성공한 뒤 중앙 저장소를 한 번 초기화하고 각 부위를 추가한다. `AddParticles`는 첫 중앙 ID를 반환하므로 두 번째 부위가 첫 번째를 덮어쓰지 않는다.
 - 실제 `AddInstances` 반환 인덱스로 양방향 연결을 채운다. 중앙 ID와 ISM 인덱스가 같다고 가정하지 않는다.
-- `PartGap` 기본 150cm. 초기 도형의 Y 반크기와 구체 반지름으로 표면 사이 여유를 확보하고 왼팔 위치를 정한다. 재분배마다 부위 중심을 재배치하지는 않는다.
+- `PartGap` 기본 150cm. 데이터에 왼팔이 있으면 초기 도형의 Y 반크기와 구체 반지름으로 표면 사이 여유를 확보하고 왼팔 위치를 정한다. 재분배마다 부위 중심을 재배치하지는 않는다.
+- 몸통·왼팔 외 부위는 연결 위치 규칙을 정하기 전까지 Manager 중심(상대 위치 0)에 놓여 몸통과 겹친다. 임시 상태다.
 - 데이터의 `RelativeLocation`·`RelativeRotation`은 유효성만 검사하고 아직 적용하지 않는다. 고정 cm 위치는 축소 후 관절 간격이 벌어지거나 겹칠 수 있어, 연결 위치 계산 방식을 거인 전체 부위 추가 때 함께 정한다(2026-11-14 결정).
 - 생성 때만 초기 개수 설정을 사용한다. 이후 전체 생존 수의 기준은 Store다.
 
@@ -120,7 +123,7 @@ ASwarmBossManager
 
 `T → RebalanceSwarmPartsForTest → 각 Manager.RebalancePartsFromDefinition → RebalanceParts(RemainderPart, OtherPart, 가중치, 가중치)`.
 
-`RebalancePartsFromDefinition`은 T 입력 시점의 `FormDefinition`을 다시 검증하고 부위 가중치만 읽는다. 잔여 수신 부위를 첫 번째 부위로 넘기므로 초기 생성과 같은 배분 규칙을 따른다. 도형 종류·비율은 마지막 초기 생성 때 보관한 설정을 사용한다. 데이터가 없거나 유효하지 않거나 부위가 둘이 아니면 경고 후 상태를 바꾸지 않는다. 가중치 0인 부위는 구체를 모두 다른 부위로 보낸다.
+`RebalancePartsFromDefinition`은 T 입력 시점의 `FormDefinition`을 다시 검증하고 부위 가중치만 읽는다. 잔여 수신 부위를 첫 번째 부위로 넘기므로 초기 생성과 같은 배분 규칙을 따른다. 도형 종류·비율은 마지막 초기 생성 때 보관한 설정을 사용한다. 데이터가 없거나 유효하지 않거나, 생성 후 데이터의 부위 목록이 바뀌어 생성된 ISM과 다르거나, 부위가 둘이 아니면 경고 후 상태를 바꾸지 않는다. 부위 목록이 바뀌었으면 다시 생성해야 한다. 가중치 0인 부위는 구체를 모두 다른 부위로 보낸다.
 
 1. 두 부위의 현재 생존 수 합계로 목표 개수를 계산한다. 두 번째 부위는 버림, 첫 번째는 나머지를 받는다. 가중치는 0 이상, 합은 양수여야 한다.
 2. 이미 목표 개수와 같으면 성공 반환하며 샘플링·이동 재시작을 하지 않는다. 비율이 맞으면 결손이 있어도 새 배치를 만들지 않는 현재 제한이 있다.
@@ -232,20 +235,25 @@ Manager 공통 기능: 생존 수 관리, 배분, 샘플러 호출, 목표 배�
 ## 7. 다음 구현 순서
 
 1. ~~부위 구성 데이터 설계 → 기존 몸통·왼팔을 그 데이터로 생성. 현재 클릭·전달·재분배 동작 유지.~~ 완료(2026-11-14).
-2. 거인 전체 부위 추가. 부위 ISM을 데이터 기반으로 생성, 부모 상대 연결 위치 계산 방식 결정, 비율·잔여·0개 부위·연결 관계 확인.
+2. 거인 전체 부위 추가. 하위 단계로 나눠 진행한다.
+   1. ~~부위 ISM을 데이터 기반으로 생성.~~ 완료(2026-11-14).
+   2. 부모 기준 연결 위치 계산 방식 결정과 적용. 고정 `RelativeLocation`과 부모 도형 크기 기반 계산 중 선택한다.
+   3. `DA_GiantForm`에 거인 10부위 입력, 비율·잔여·0개 부위·연결 관계 확인. 그때까지 두 부위만 지원하는 T 재분배의 처리(막기 또는 전체 재배치)를 정한다.
 3. 거인 부위/그룹 이동·회전과 행동. 구체 고정 크기와 상대 좌표 유지 확인.
 4. 현재 두 부위 재분배를 전체 연결 관계로 확장. 관절 공간 검색 도입은 필요성을 따로 판단.
 5. 고정 N자루 복합 검 구성과 행동.
 6. 계획 준비 → 무적 전환 → 직접 이동 → 도착 완료의 변신 흐름 연결.
 7. 극소수/실패 처리, 전수 검사 실행 분리, 성능 측정과 데모 마무리.
 
-이 목록 전체를 다음 한 번의 변경으로 구현하지 않는다. 몸통·왼팔 생성과 T 재분배의 데이터 연결은 끝났으며 바로 다음 작업은 거인 전체 부위 추가다.
+이 목록 전체를 다음 한 번의 변경으로 구현하지 않는다. 데이터 기반 생성·T 재분배·부위 ISM 생성은 끝났으며 바로 다음 작업은 2-2 연결 위치 계산 방식 결정이다.
 
 ## 8. 검증과 작업 명령
 
 형태 데이터 생성 연결: Editor 타깃 빌드 성공, 자동 테스트 11개 성공/실패0(`Saved/Automation/FormDefinitionLink/index.json`). 사용자가 `DA_GiantForm`을 지정한 Editor Play에서 생성·제거·재분배가 이전과 같이 동작함을 확인했다.
 
 T 재분배의 데이터 가중치 사용: Editor 타깃 빌드 성공, 자동 테스트 11개 성공/실패0(`Saved/Automation/DefinitionRebalance/index.json`, `reportCreatedOn` `2026.11.13-17.18.36` 보고서 표기 그대로). 사용자가 에셋 가중치를 10:1로 바꾼 Editor Play에서 생성과 T 재분배가 그 비율을 따르는 것을 확인했다.
+
+부위 ISM 데이터 기반 생성: Editor 타깃 빌드 성공, 자동 테스트 11개 성공/실패0(`Saved/Automation/DataDrivenInstances/index.json`, `reportCreatedOn` `2026.11.13-17.31.36` 보고서 표기 그대로). 사용자가 에디터에서 레벨에 저장된 기존 Manager가 경고 없이 로드되고, Play에서 생성·클릭 제거·T 재분배가 이전과 같이 동작함을 확인했다.
 
 실행 로그와 JSON은 로컬 Saved에 있고 Git에는 포함되지 않는다.
 
@@ -261,7 +269,7 @@ T 재분배의 데이터 가중치 사용: Editor 타깃 빌드 성공, 자동 �
 | Stage2.TransferBatch | 여러 개 전달과 실패 입력 |
 | Stage2.RebalanceParts | 양방향 전달·정수 잔여·반복 요청·가중치 입력 거부 |
 | Stage2.TimedReconstruction | 설정 시간·감속·재배정·잘못된 시간 |
-| Stage2.FormDefinition | 데이터 누락, 가중치 배분과 잔여, 가중치 0, 잘못된 데이터 12종 거부, 데이터 가중치 재분배·변경 반영 |
+| Stage2.FormDefinition | 데이터 누락, 가중치 배분과 잔여, 가중치 0, 잘못된 데이터 10종 거부, 데이터 목록대로 부위 ISM 생성·제거, 세 부위·목록 변경 시 재분배 거절, 데이터 가중치 재분배·변경 반영 |
 
 사용자는 Play에서 이동 중 피격 제거, 부위 전달, 양방향 재분배와 축소를 확인했고 0.8초 이동을 선택했다. 이는 성능 비교나 미구현 거인/검/변신 검증이 아니다. NullRHI 자동 테스트는 실제 화면·패키징 검증을 대신하지 않는다.
 

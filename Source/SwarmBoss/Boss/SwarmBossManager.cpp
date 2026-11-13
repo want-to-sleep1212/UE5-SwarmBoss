@@ -39,8 +39,8 @@ namespace
 	}
 }
 
-// 몸통과 왼팔의 구체 메시를 표시하고 충돌을 조회할 ISM(UInstancedStaticMeshComponent)을 각각 만든다.
-// Parts에 부위별 ISM을 등록하고, 이동 목표가 있을 때만 Actor Tick을 사용하도록 설정한다.
+// 부위 ISM을 붙일 루트 컴포넌트와 구체 메시를 준비하고, 이동 목표가 있을 때만 Actor Tick을 사용하도록 설정한다.
+// 부위별 ISM은 생성자에서 만들지 않고 GenerateInitialParts()가 FormDefinition의 부위 목록에 맞춰 만든다.
 ASwarmBossManager::ASwarmBossManager()
 {
 	PrimaryActorTick.bCanEverTick = true;
@@ -49,25 +49,79 @@ ASwarmBossManager::ASwarmBossManager()
 	USceneComponent* BossRoot = CreateDefaultSubobject<USceneComponent>(TEXT("BossRoot"));
 	SetRootComponent(BossRoot);
 
-	TorsoInstances = CreateDefaultSubobject<UInstancedStaticMeshComponent>(TEXT("TorsoInstances"));
-	LeftArmInstances = CreateDefaultSubobject<UInstancedStaticMeshComponent>(TEXT("LeftArmInstances"));
-
 	static ConstructorHelpers::FObjectFinder<UStaticMesh> Sphere(TEXT("/Engine/BasicShapes/Sphere.Sphere"));
 
-	for (UInstancedStaticMeshComponent* PartInstances : {TorsoInstances.Get(), LeftArmInstances.Get()})
+	if (Sphere.Succeeded())
 	{
-		PartInstances->SetupAttachment(BossRoot);
-		PartInstances->SetMobility(EComponentMobility::Movable);
-		PartInstances->SetCanEverAffectNavigation(false);
+		SphereMesh = Sphere.Object;
+	}
+}
 
-		if (Sphere.Succeeded())
-		{
-			PartInstances->SetStaticMesh(Sphere.Object);
-		}
+// PartId 부위의 ISM을 반환한다. 아직 생성하지 않았거나 마지막 생성 데이터에 없는 부위이면 nullptr를 반환한다.
+UInstancedStaticMeshComponent* ASwarmBossManager::GetPartInstances(ESwarmPartId PartId) const
+{
+	const FSwarmPart* Part = Parts.Find(PartId);
+
+	return Part ? Part->Instances.Get() : nullptr;
+}
+
+// Definition의 부위 목록과 Parts의 ISM 구성을 일치시킨다.
+// 목록에 없는 부위의 ISM은 파괴하고 Parts에서 제거하며, 목록에 새로 생긴 부위는 루트에 붙인 ISM을 만들어 등록한다.
+// 이미 있는 부위의 ISM은 재사용한다. 인스턴스와 대응표는 비우지 않으므로 호출 직후 InitializeParticles()로 다시 채워야 한다.
+void ASwarmBossManager::SyncPartInstances(const USwarmFormDefinition& Definition)
+{
+	TSet<ESwarmPartId> DefinedPartIds;
+
+	for (const FSwarmPartDefinition& PartDefinition : Definition.Parts)
+	{
+		DefinedPartIds.Add(PartDefinition.PartId);
 	}
 
-	Parts.FindOrAdd(ESwarmPartId::Torso).Instances = TorsoInstances;
-	Parts.FindOrAdd(ESwarmPartId::LeftArm).Instances = LeftArmInstances;
+	for (auto It = Parts.CreateIterator(); It; ++It)
+	{
+		if (DefinedPartIds.Contains(It.Key()))
+		{
+			continue;
+		}
+
+		if (IsValid(It.Value().Instances))
+		{
+			It.Value().Instances->DestroyComponent();
+		}
+
+		It.RemoveCurrent();
+	}
+
+	for (const ESwarmPartId PartId : DefinedPartIds)
+	{
+		FSwarmPart& Part = Parts.FindOrAdd(PartId);
+
+		if (IsValid(Part.Instances))
+		{
+			continue;
+		}
+
+		// 컴포넌트 이름은 "부위명Instances"(예: TorsoInstances)이며, 파괴 직후 같은 이름이 남아 있으면 번호를 붙인다.
+		const FString BaseName = StaticEnum<ESwarmPartId>()->GetNameStringByValue(static_cast<int64>(PartId)) + TEXT("Instances");
+		FName ComponentName(*BaseName);
+
+		if (StaticFindObjectFast(nullptr, this, ComponentName))
+		{
+			ComponentName = MakeUniqueObjectName(this, UInstancedStaticMeshComponent::StaticClass(), ComponentName);
+		}
+
+		UInstancedStaticMeshComponent* Instances = NewObject<UInstancedStaticMeshComponent>(this, ComponentName);
+
+		Instances->SetupAttachment(GetRootComponent());
+		Instances->SetMobility(EComponentMobility::Movable);
+		Instances->SetCanEverAffectNavigation(false);
+		Instances->SetCollisionProfileName(TEXT("SwarmSpherePreset"));
+		Instances->SetStaticMesh(SphereMesh);
+		Instances->RegisterComponent();
+		AddInstanceComponent(Instances);
+
+		Part.Instances = Instances;
+	}
 }
 
 // Play 시작 시 GenerateInitialParts()를 호출해 몸통과 왼팔의 구체를 생성한다.
@@ -80,7 +134,8 @@ void ASwarmBossManager::BeginPlay()
 
 // FormDefinition의 부위 목록에 따라 InitialParticleCount를 가중치 비율로 나누고, 부위마다 도형 중심 기준의 구체 좌표를 계산한다.
 // 정수 배분의 나머지는 RemainderPartId 부위가 받는다. 초기 설정값은 생존 수와 별도로 유지한다.
-// 모든 부위의 계산이 성공하면 구체를 생성하고, 생성 크기와 PartGap으로 왼팔 위치를 정해 두 도형을 분리한다.
+// 모든 부위의 계산이 성공하면 부위 ISM을 데이터 목록에 맞춰 만들거나 제거한 뒤 구체를 생성한다.
+// 왼팔이 있으면 생성 크기와 PartGap으로 몸통 옆에 두고, 나머지 부위는 연결 위치 규칙을 정할 때까지 Manager 중심에 둔다.
 // 데이터의 RelativeLocation·RelativeRotation은 아직 적용하지 않는다. 축소 후 연결 위치 계산 방식을 정한 뒤 사용한다.
 // 성공한 설정은 부위별로 보관한다. 데이터 누락·잘못된 설정·생성 실패는 기존 상태를 유지하고 false를 반환한다.
 bool ASwarmBossManager::GenerateInitialParts()
@@ -144,6 +199,9 @@ bool ASwarmBossManager::GenerateInitialParts()
 
 	const FSwarmSamplingSettings& TorsoSettings = PartSettings.FindChecked(ESwarmPartId::Torso);
 
+	// 샘플링이 모두 성공한 뒤에 ISM 구성을 데이터에 맞춘다. 이후 InitializeParticles()가 모든 부위를 다시 채운다.
+	SyncPartInstances(*FormDefinition);
+
 	if (!InitializeParticles(Placements, TorsoSettings.ParticleRadius))
 	{
 		return false;
@@ -154,11 +212,20 @@ bool ASwarmBossManager::GenerateInitialParts()
 		Parts.FindChecked(Pair.Key).SamplingSettings = Pair.Value;
 	}
 
-	const FSwarmSamplingSettings& LeftArmSettings = PartSettings.FindChecked(ESwarmPartId::LeftArm);
-	const double CenterDistance = PartResults.FindChecked(ESwarmPartId::Torso).HalfExtents.Y
-		+ PartResults.FindChecked(ESwarmPartId::LeftArm).HalfExtents.Y
-		+ TorsoSettings.ParticleRadius + LeftArmSettings.ParticleRadius + PartGap;
-	LeftArmInstances->SetRelativeLocation(FVector(0.0, -CenterDistance, 15.0));
+	// TODO: 부모 기준 연결 위치 계산 방식을 정하면 모든 부위에 적용한다.
+	// 그 전까지 왼팔은 기존 PartGap 계산으로 몸통 옆에 두고, 그 밖의 부위는 Manager 중심에 둔다.
+	for (const TPair<ESwarmPartId, FSwarmPart>& Pair : Parts)
+	{
+		Pair.Value.Instances->SetRelativeLocation(FVector::ZeroVector);
+	}
+
+	if (const FSwarmSamplingSettings* LeftArmSettings = PartSettings.Find(ESwarmPartId::LeftArm))
+	{
+		const double CenterDistance = PartResults.FindChecked(ESwarmPartId::Torso).HalfExtents.Y
+			+ PartResults.FindChecked(ESwarmPartId::LeftArm).HalfExtents.Y
+			+ TorsoSettings.ParticleRadius + LeftArmSettings->ParticleRadius + PartGap;
+		Parts.FindChecked(ESwarmPartId::LeftArm).Instances->SetRelativeLocation(FVector(0.0, -CenterDistance, 15.0));
+	}
 
 	return true;
 }
@@ -170,8 +237,7 @@ void ASwarmBossManager::SetFormDefinition(USwarmFormDefinition* NewFormDefinitio
 }
 
 // Definition을 이 Manager가 생성할 수 있는지 검사한다. 문제가 있으면 첫 번째 원인을 경고 로그로 남기고 false를 반환한다.
-// 검사 항목: 부위 ID 유일성과 None/Preview 금지, 이 Manager에 ISM이 있는 부위를 빠짐없이 정의했는지,
-// 가중치가 0 이상이고 합이 0보다 큰지, 종횡비·자세 값의 유효성, 부모가 같은 목록 안에 있는지,
+// 검사 항목: 부위 ID 유일성과 None/Preview 금지, 가중치가 0 이상이고 합이 0보다 큰지, 종횡비·자세 값의 유효성, 부모가 같은 목록 안에 있는지,
 // 부모 없는 최상위 부위가 몸통 하나뿐인지, 순환 연결이 없는지, 잔여 수신 부위가 목록 안에 있는지.
 // 에디터의 Clamp 메타데이터는 코드·잘못된 에셋으로 들어온 값을 막지 못하므로 여기서 다시 검사한다.
 bool ASwarmBossManager::ValidateFormDefinition(const USwarmFormDefinition& Definition) const
@@ -200,11 +266,6 @@ bool ASwarmBossManager::ValidateFormDefinition(const USwarmFormDefinition& Defin
 			return Fail(FString::Printf(TEXT("%s is defined more than once."), *PartName));
 		}
 
-		if (!Parts.Contains(Part.PartId))
-		{
-			return Fail(FString::Printf(TEXT("%s has no instance component in this manager."), *PartName));
-		}
-
 		if (Part.AllocationWeight < 0)
 		{
 			return Fail(FString::Printf(TEXT("%s has a negative allocation weight."), *PartName));
@@ -227,11 +288,6 @@ bool ASwarmBossManager::ValidateFormDefinition(const USwarmFormDefinition& Defin
 
 		ParentOf.Add(Part.PartId, Part.ParentPartId);
 		WeightSum += Part.AllocationWeight;
-	}
-
-	if (ParentOf.Num() != Parts.Num())
-	{
-		return Fail(TEXT("Every part owned by the manager must be defined."));
 	}
 
 	if (WeightSum <= 0)
@@ -746,7 +802,7 @@ bool ASwarmBossManager::RebalanceParts(ESwarmPartId FirstPartId, ESwarmPartId Se
 // T 입력 시점의 FormDefinition에서 부위별 AllocationWeight를 읽어 RebalanceParts()에 전달한다.
 // RemainderPartId 부위를 첫 번째 부위로 넘겨 버림 나머지를 받게 하므로 초기 생성과 같은 배분 규칙을 따른다.
 // 가중치만 다시 읽으며, 도형 종류·종횡비는 마지막 초기 생성 때 보관한 설정을 그대로 사용한다.
-// 데이터가 없거나 유효하지 않거나 부위가 둘이 아니면 경고를 남기고 상태를 바꾸지 않은 채 false를 반환한다.
+// 데이터가 없거나 유효하지 않거나, 생성된 부위와 목록이 다르거나, 부위가 둘이 아니면 경고를 남기고 상태를 바꾸지 않은 채 false를 반환한다.
 // TODO: 거인 전체 부위를 추가할 때 연결 관계를 따라 여러 부위를 재분배하도록 확장한다.
 bool ASwarmBossManager::RebalancePartsFromDefinition()
 {
@@ -758,6 +814,22 @@ bool ASwarmBossManager::RebalancePartsFromDefinition()
 
 	if (!ValidateFormDefinition(*FormDefinition))
 	{
+		return false;
+	}
+
+	// 생성 후 데이터의 부위 목록이 바뀌었다면 ISM 구성과 맞지 않으므로 다시 생성하기 전까지 재분배하지 않는다.
+	bool bPartsMatch = FormDefinition->Parts.Num() == Parts.Num();
+
+	for (const FSwarmPartDefinition& Part : FormDefinition->Parts)
+	{
+		bPartsMatch &= Parts.Contains(Part.PartId);
+	}
+
+	if (!bPartsMatch)
+	{
+		UE_LOG(LogSwarmBossManager, Warning,
+			TEXT("FormDefinition %s parts differ from the generated parts of %s. Regenerate before rebalancing."),
+			*FormDefinition->GetName(), *GetName());
 		return false;
 	}
 

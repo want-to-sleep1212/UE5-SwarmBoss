@@ -249,11 +249,12 @@ bool FSwarmManagerBehaviorTest::RunTest(const FString& Parameters)
 	}
 
 	ASwarmBossManager* Boss = SpawnTwoPartManager(World);
-	if (TestNotNull(TEXT("Boss manager"), Boss))
+	// 부위 ISM은 형태 데이터로 생성할 때 만들어지므로, 단일 도형 검증 전에 몸통·왼팔 ISM을 먼저 준비한다.
+	if (TestNotNull(TEXT("Boss manager"), Boss) && TestTrue(TEXT("Create part instances"), Boss->GenerateInitialParts()))
 	{
 		FSwarmSamplingSettings Settings;
 		FVector AppliedHalfExtents = FVector::ZeroVector;
-		UInstancedStaticMeshComponent* Instances = Boss->TorsoInstances.Get();
+		UInstancedStaticMeshComponent* Instances = Boss->GetPartInstances(ESwarmPartId::Torso);
 
 		// 몸통에만 샘플러 결과를 넣고 왼팔은 비워서 기존 단일 도형 실행 검증을 유지한다.
 		auto Generate = [&]()
@@ -508,8 +509,8 @@ bool FSwarmManagerBehaviorTest::RunTest(const FString& Parameters)
 			TestTrue(TEXT("Configured total generates successfully"), Boss->GenerateInitialParts());
 			TestEqual(TEXT("Configured total matches survivors"), Boss->GetActiveParticleCount(), TotalCount);
 			TestEqual(TEXT("Configured total matches central slots"), Boss->GetParticles().Num(), TotalCount);
-			TestEqual(TEXT("Arm receives integer third"), Boss->LeftArmInstances->GetInstanceCount(), TotalCount / 3);
-			TestEqual(TEXT("Torso receives remainder"), Boss->TorsoInstances->GetInstanceCount(), TotalCount - TotalCount / 3);
+			TestEqual(TEXT("Arm receives integer third"), Boss->GetPartInstances(ESwarmPartId::LeftArm)->GetInstanceCount(), TotalCount / 3);
+			TestEqual(TEXT("Torso receives remainder"), Boss->GetPartInstances(ESwarmPartId::Torso)->GetInstanceCount(), TotalCount - TotalCount / 3);
 
 			if (TotalCount >= 5)
 			{
@@ -518,7 +519,7 @@ bool FSwarmManagerBehaviorTest::RunTest(const FString& Parameters)
 				for (const FSwarmParticle& Particle : Boss->GetParticles())
 				{
 					UInstancedStaticMeshComponent* Part = Particle.PartId == ESwarmPartId::Torso
-						? Boss->TorsoInstances.Get() : Boss->LeftArmInstances.Get();
+						? Boss->GetPartInstances(ESwarmPartId::Torso) : Boss->GetPartInstances(ESwarmPartId::LeftArm);
 					// Manager가 회전되어 있으므로 배치 기준인 Manager 로컬 Y축에서 표면 간격을 측정한다.
 					const FVector WorldPosition = Part->GetComponentTransform().TransformPosition(Particle.LocalPosition);
 					const double CenterY = Boss->GetActorTransform().InverseTransformPosition(WorldPosition).Y;
@@ -1233,10 +1234,6 @@ bool FSwarmFormDefinitionTest::RunTest(const FString& Parameters)
 			[](USwarmFormDefinition& D) { D.Parts[1].PartId = ESwarmPartId::Torso; }},
 		{TEXT("None part"), TEXT("cannot be used as a part"),
 			[](USwarmFormDefinition& D) { D.Parts[1].PartId = ESwarmPartId::None; }},
-		{TEXT("Part without instance component"), TEXT("has no instance component"),
-			[](USwarmFormDefinition& D) { D.Parts[1].PartId = ESwarmPartId::Head; }},
-		{TEXT("Missing manager part"), TEXT("Every part owned by the manager must be defined"),
-			[](USwarmFormDefinition& D) { D.Parts.RemoveAt(1); }},
 		{TEXT("Negative weight"), TEXT("negative allocation weight"),
 			[](USwarmFormDefinition& D) { D.Parts[1].AllocationWeight = -1; }},
 		{TEXT("Zero weight sum"), TEXT("must sum to a positive value"),
@@ -1267,20 +1264,65 @@ bool FSwarmFormDefinitionTest::RunTest(const FString& Parameters)
 			Boss->GetActiveParticleCount(), 90);
 	}
 
+	// 부위 ISM은 데이터 목록대로 만들어져야 한다. 몸통 2·왼팔 1·머리 1(합 4)로 90개를 나누면
+	// 45/22/22에 버림 나머지 1개가 몸통으로 가서 46/22/22가 된다.
+	auto CountPartComponents = [Boss]()
+	{
+		return TInlineComponentArray<UInstancedStaticMeshComponent*>(Boss).Num();
+	};
+
+	USwarmFormDefinition* ThreePartDefinition = CreateTwoPartDefinition();
+	FSwarmPartDefinition& HeadDefinition = ThreePartDefinition->Parts.AddDefaulted_GetRef();
+	HeadDefinition.PartId = ESwarmPartId::Head;
+	HeadDefinition.ParentPartId = ESwarmPartId::Torso;
+	HeadDefinition.Shape = ESwarmPrimitive::Sphere;
+	HeadDefinition.AllocationWeight = 1;
+	Boss->SetFormDefinition(ThreePartDefinition);
+
+	if (TestTrue(TEXT("Three part definition generates"), Boss->GenerateInitialParts()))
+	{
+		UInstancedStaticMeshComponent* Head = Boss->GetPartInstances(ESwarmPartId::Head);
+
+		if (TestNotNull(TEXT("Head ISM is created from data"), Head))
+		{
+			TestEqual(TEXT("Head ISM holds its share"), Head->GetInstanceCount(), 22);
+			TestTrue(TEXT("Head ISM is attached to the manager root"), Head->GetAttachParent() == Boss->GetRootComponent());
+			TestTrue(TEXT("Head ISM is registered"), Head->IsRegistered());
+		}
+
+		TestEqual(TEXT("Three part ISMs exist"), CountPartComponents(), 3);
+		TestEqual(TEXT("Three part torso"), CountActivePartParticles(*Boss, ESwarmPartId::Torso), 46);
+		TestEqual(TEXT("Three part arm"), CountActivePartParticles(*Boss, ESwarmPartId::LeftArm), 22);
+		TestEqual(TEXT("Three part head"), CountActivePartParticles(*Boss, ESwarmPartId::Head), 22);
+
+		// 현재 재분배는 두 부위만 지원하므로 세 부위 데이터에서는 상태를 바꾸지 않고 거절해야 한다.
+		AddExpectedError(TEXT("supports exactly two parts"), EAutomationExpectedErrorFlags::Contains, 1);
+		TestFalse(TEXT("Three part rebalance is rejected"), Boss->RebalancePartsFromDefinition());
+	}
+
+	// 데이터에서 머리를 빼고 다시 생성하기 전에는 생성된 부위와 목록이 다르므로 재분배를 거절한다.
+	Boss->SetFormDefinition(CreateTwoPartDefinition());
+	AddExpectedError(TEXT("differ from the generated parts"), EAutomationExpectedErrorFlags::Contains, 1);
+	TestFalse(TEXT("Stale part list rebalance is rejected"), Boss->RebalancePartsFromDefinition());
+	TestEqual(TEXT("Rejected rebalance keeps head particles"), CountActivePartParticles(*Boss, ESwarmPartId::Head), 22);
+
+	// 다시 생성하면 목록에서 빠진 머리 ISM을 제거하고 남은 두 부위만 2:1로 채운다.
+	if (TestTrue(TEXT("Two part definition regenerates"), Boss->GenerateInitialParts()))
+	{
+		TestNull(TEXT("Removed head ISM is released"), Boss->GetPartInstances(ESwarmPartId::Head));
+		TestEqual(TEXT("Only two part ISMs remain"), CountPartComponents(), 2);
+		TestEqual(TEXT("Regenerated torso"), CountActivePartParticles(*Boss, ESwarmPartId::Torso), 60);
+		TestEqual(TEXT("Regenerated arm"), CountActivePartParticles(*Boss, ESwarmPartId::LeftArm), 30);
+		TestEqual(TEXT("Regenerated store size"), Boss->GetParticles().Num(), 90);
+	}
+
 	// T 재분배도 입력 시점의 형태 데이터 가중치를 읽어야 한다. 3:4로 39/51을 만든 뒤 왼팔 6개를 제거하면 39/45가 된다.
 	// 합계 84를 3:4로 나누면 왼팔 48(버림), 몸통 36이므로 몸통에서 왼팔로 3개가 이동한다.
 	Boss->SetFormDefinition(WeightedDefinition);
 	UInstancedStaticMeshComponent* Arm = nullptr;
 
-	for (UInstancedStaticMeshComponent* Part : TInlineComponentArray<UInstancedStaticMeshComponent*>(Boss))
-	{
-		if (Part->GetFName() == TEXT("LeftArmInstances"))
-		{
-			Arm = Part;
-		}
-	}
-
-	if (TestNotNull(TEXT("Arm component"), Arm) && TestTrue(TEXT("Regenerate weighted parts"), Boss->GenerateInitialParts()))
+	if (TestTrue(TEXT("Regenerate weighted parts"), Boss->GenerateInitialParts())
+		&& TestNotNull(TEXT("Arm component"), Arm = Boss->GetPartInstances(ESwarmPartId::LeftArm)))
 	{
 		for (int32 Index = 0; Index < 6; ++Index)
 		{

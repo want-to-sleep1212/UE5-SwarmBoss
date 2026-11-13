@@ -7,6 +7,7 @@
 
 class UInstancedStaticMeshComponent;
 class UPrimitiveComponent;
+class UStaticMesh;
 class USwarmFormDefinition;
 
 // 초기 생성할 부위와 해당 ISM 컴포넌트 기준의 구체 중심 좌표 목록.
@@ -61,6 +62,7 @@ public:
 
 	int32 GetActiveParticleCount() const;
 	const TArray<FSwarmParticle>& GetParticles() const;
+	UInstancedStaticMeshComponent* GetPartInstances(ESwarmPartId PartId) const;
 
 	// 중앙 Particles 배열 순서대로 지정 부위의 활성 구체를 최대 MaxCount개 선택해 ParticleId 목록을 반환한다.
 	TArray<int32> SelectPartParticleIds(ESwarmPartId PartId, int32 MaxCount) const;
@@ -82,12 +84,13 @@ private:
 	void ResetParticles(int32 ExpectedParticleCount);
 
 	bool ValidateFormDefinition(const USwarmFormDefinition& Definition) const;
+	void SyncPartInstances(const USwarmFormDefinition& Definition);
 
 	FSwarmPart* FindPartByComponent(const UPrimitiveComponent* HitComponent);
 	bool UpdateParticleMovement(float DeltaTime);
 
 	// 초기 생성할 부위의 도형·종횡비·배분 가중치를 담은 형태 데이터. 비어 있으면 생성하지 않는다.
-	// 현재 Manager는 몸통과 왼팔 ISM만 가지므로 이 두 부위를 정확히 정의한 데이터만 사용할 수 있다.
+	// 부위별 ISM은 생성 시점에 이 데이터의 부위 목록대로 만들어진다.
 	UPROPERTY(EditAnywhere, Category="Swarm|Generation")
 	TObjectPtr<USwarmFormDefinition> FormDefinition;
 
@@ -101,12 +104,11 @@ private:
 
 	FSwarmParticleStore ParticleStore;
 
+	// 마지막으로 생성한 부위별 ISM과 대응표. GenerateInitialParts()가 FormDefinition의 부위 목록과 일치시킨다.
 	UPROPERTY()
 	TMap<ESwarmPartId, FSwarmPart> Parts;
 
-	UPROPERTY(VisibleAnywhere, Category="Swarm")
-	TObjectPtr<UInstancedStaticMeshComponent> TorsoInstances;
-
-	UPROPERTY(VisibleAnywhere, Category="Swarm")
-	TObjectPtr<UInstancedStaticMeshComponent> LeftArmInstances;
+	// 모든 부위 ISM에 지정할 구체 메시(/Engine/BasicShapes/Sphere).
+	UPROPERTY()
+	TObjectPtr<UStaticMesh> SphereMesh;
 };
