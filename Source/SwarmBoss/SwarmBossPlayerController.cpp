@@ -8,8 +8,7 @@
 #include "EngineUtils.h"
 #include "SwarmCrosshairHUD.h"
 #include "InputCoreTypes.h"
-#include "Swarm/SwarmRuntimeComponent.h"
-#include "Swarm/SwarmShapePreview.h"
+#include "Boss/SwarmBossManager.h"
 
 #include "EnhancedInputSubsystems.h"
 #include "Engine/LocalPlayer.h"
@@ -19,12 +18,14 @@
 #include "SwarmBoss.h"
 #include "Widgets/Input/SVirtualJoystick.h"
 
+// 플레이어가 사용할 카메라 매니저 클래스를 지정한다.
 ASwarmBossPlayerController::ASwarmBossPlayerController()
 {
 	// set the player camera manager class
 	PlayerCameraManagerClass = ASwarmBossCameraManager::StaticClass();
 }
 
+// 로컬 플레이어의 조준선을 설정하고, 터치 입력을 쓰는 환경에서는 터치 위젯을 표시한다.
 void ASwarmBossPlayerController::BeginPlay()
 {
 	Super::BeginPlay();
@@ -56,6 +57,7 @@ void ASwarmBossPlayerController::BeginPlay()
 	}
 }
 
+// 로컬 플레이어의 클릭 제거와 T 키 부위 전달 테스트 입력, 입력 매핑을 등록한다.
 void ASwarmBossPlayerController::SetupInputComponent()
 {
 	Super::SetupInputComponent();
@@ -73,13 +75,8 @@ void ASwarmBossPlayerController::SetupInputComponent()
 			EKeys::T,
 			IE_Pressed,
 			this,
-			&ASwarmBossPlayerController::MoveSwarmParticlesForPreview);
+			&ASwarmBossPlayerController::RebalanceSwarmPartsForTest);
 
-		InputComponent->BindKey(
-			EKeys::R,
-			IE_Pressed,
-			this,
-			&ASwarmBossPlayerController::ReconstructSwarmForPreview);
 	}
 
 
@@ -107,12 +104,15 @@ void ASwarmBossPlayerController::SetupInputComponent()
 	
 }
 
+// 가상 조이스틱 표시 조건이나 강제 설정에 따라 터치 조작을 사용할지 판정한다.
 bool ASwarmBossPlayerController::ShouldUseTouchControls() const
 {
 	// are we on a mobile platform? Should we force touch?
 	return SVirtualJoystick::ShouldDisplayTouchInterface() || bForceTouchControls;
 }
 
+// 플레이어 카메라 정면으로 SwarmSphere 충돌 타입을 검사해 처음 맞은 구체를 찾는다.
+// 피격 Actor가 ASwarmBossManager이면 메시 컴포넌트와 Hit.Item 인스턴스 번호를 직접 넘겨 구체 제거를 요청한다.
 void ASwarmBossPlayerController::TraceSwarmParticle()
 {
 	UWorld* World = GetWorld();
@@ -151,48 +151,33 @@ void ASwarmBossPlayerController::TraceSwarmParticle()
 		return;
 	}
 
-	const AActor* HitActor = Hit.GetActor();
-	USwarmRuntimeComponent* SwarmRuntime = HitActor
-		? HitActor->FindComponentByClass<USwarmRuntimeComponent>()
-		: nullptr;
+	ASwarmBossManager* Boss = Cast<ASwarmBossManager>(Hit.GetActor());
 
-	if (!SwarmRuntime || !SwarmRuntime->RemoveInstance(Hit.GetComponent(), Hit.Item))
+	if (!Boss || !Boss->RemoveInstance(Hit.GetComponent(), Hit.Item))
 	{
 		UE_LOG(LogSwarmBoss, Warning,
-			TEXT("Swarm trace: invalid runtime component or instance. Actor=%s Instance=%d"),
+			TEXT("Swarm trace: invalid boss manager or instance. Actor=%s Instance=%d"),
 			*GetNameSafe(Hit.GetActor()),
 			Hit.Item);
 	}
 }
 
-void ASwarmBossPlayerController::MoveSwarmParticlesForPreview()
+// T 키로 각 Manager의 몸통·왼팔을 현재 생존 수 기준 2:1로 재분배하도록 요청한다.
+// 초과 부위에서 부족 부위로 필요한 만큼 전달하고 목표를 배정하는 결정은 Manager가 담당한다.
+void ASwarmBossPlayerController::RebalanceSwarmPartsForTest()
 {
 	UWorld* World = GetWorld();
 
-	if (!World)
+	if (!World || !IsLocalPlayerController())
 	{
 		return;
 	}
 
-	const FVector LocalOffset(1000.0, 0.0, 0.0);
-
-	for (TActorIterator<ASwarmShapePreview> Preview(World); Preview; ++Preview)
+	for (TActorIterator<ASwarmBossManager> Boss(World); Boss; ++Boss)
 	{
-		Preview->SwarmRuntime->OffsetActiveParticleTargets(LocalOffset);
-	}
-}
-
-void ASwarmBossPlayerController::ReconstructSwarmForPreview()
-{
-	UWorld* World = GetWorld();
-
-	if (!World)
-	{
-		return;
-	}
-
-	for (TActorIterator<ASwarmShapePreview> Preview(World); Preview; ++Preview)
-	{
-		Preview->ReconstructPreview();
+		if (!Boss->RebalanceParts(ESwarmPartId::Torso, ESwarmPartId::LeftArm, 2, 1))
+		{
+			UE_LOG(LogSwarmBoss, Warning, TEXT("Rebalance failed for %s."), *Boss->GetName());
+		}
 	}
 }

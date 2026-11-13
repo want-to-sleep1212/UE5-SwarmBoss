@@ -1,16 +1,4 @@
-// SwarmShapePreview.cpp
-// ASwarmShapePreview 구현.
-// - 생성자: SwarmSpherePreset을 사용하는 ISM을 루트로 만들고 엔진 기본 구체 메시를 지정한다.
-// - OnConstruction(): Actor Scale을 1로 고정한다. 도형 크기는 Settings로만 결정한다.
-// - GeneratePreview(): 샘플러를 호출해 보고 문자열과 로그(LogSwarmShape)를 남기고, 성공 시에만 인스턴스를 교체한다.
-//   실패하면 기존 미리보기를 유지한다. 구체 스케일은 ParticleRadius로만 정한다. BeginPlay에서도 한 번 실행한다.
-// - ClearPreview(): 모든 인스턴스와 결과 값을 초기화한다.
-// - ShowBounds(): 적용된 중심 허용 영역을 10초간 디버그 도형으로 표시한다.
-// - HighlightInstance(): 인스턴스 번호로 조회한 월드 위치에 녹색 테두리를 2초간 표시한다.
-
 #include "SwarmShapePreview.h"
-
-#include "SwarmRuntimeComponent.h"
 
 #include "Components/InstancedStaticMeshComponent.h"
 #include "DrawDebugHelpers.h"
@@ -19,18 +7,15 @@
 
 DEFINE_LOG_CATEGORY_STATIC(LogSwarmShape, Log, All);
 
+// 샘플러 결과를 표시할 ISM과 엔진 기본 구체 메시를 설정한다.
+// 게임 피격 대상이 아니므로 충돌을 끄고 중앙 저장소나 Runtime을 만들지 않는다.
 ASwarmShapePreview::ASwarmShapePreview()
 {
 	Instances = CreateDefaultSubobject<UInstancedStaticMeshComponent>(TEXT("Particles"));
 	SetRootComponent(Instances);
 
-	SwarmRuntime = CreateDefaultSubobject<USwarmRuntimeComponent>(TEXT("SwarmRuntime"));
-	SwarmRuntime->BindInstances(Instances);
-	SwarmRuntime->OnActiveParticleCountChanged.AddUObject(
-		this, &ASwarmShapePreview::UpdateDisplayedActiveParticleCount);
-
 	Instances->SetMobility(EComponentMobility::Movable);
-	Instances->SetCollisionProfileName(TEXT("SwarmSpherePreset"));
+	Instances->SetCollisionProfileName(TEXT("NoCollision"));
 	Instances->SetCanEverAffectNavigation(false);
 
 	static ConstructorHelpers::FObjectFinder<UStaticMesh> Sphere(TEXT("/Engine/BasicShapes/Sphere.Sphere"));
@@ -40,6 +25,7 @@ ASwarmShapePreview::ASwarmShapePreview()
 	}
 }
 
+// 배치 범위는 샘플러 설정으로 조정할 수 있도록 Preview Actor의 스케일을 1로 고정한다.
 void ASwarmShapePreview::OnConstruction(const FTransform& Transform)
 {
 	Super::OnConstruction(Transform);
@@ -48,6 +34,7 @@ void ASwarmShapePreview::OnConstruction(const FTransform& Transform)
 	SetActorScale3D(FVector::OneVector);
 }
 
+// Play 시작 시 현재 설정으로 미리보기 구체를 생성한다.
 void ASwarmShapePreview::BeginPlay()
 {
 	Super::BeginPlay();
@@ -55,6 +42,8 @@ void ASwarmShapePreview::BeginPlay()
 	GeneratePreview();
 }
 
+// Settings의 개수와 간격 조건으로 구체 중심 좌표를 생성한다.
+// 성공한 좌표로 미리보기 구체를 교체하고, 적용한 도형 크기와 생성 결과를 Details에 기록한다.
 void ASwarmShapePreview::GeneratePreview()
 {
 	const FSwarmSamplingResult Result = FSwarmShapeSampler::GenerateTargets(Settings);
@@ -68,71 +57,45 @@ void ASwarmShapePreview::GeneratePreview()
 		return;
 	}
 
-	Modify();
+	TArray<FTransform> Transforms;
+	Transforms.Reserve(Result.Points.Num());
 
-	if (!SwarmRuntime->ReplaceParticles(Result.Points, Settings.ParticleRadius))
+	// Engine BasicShapes/Sphere의 반지름 50cm를 Settings.ParticleRadius에 맞춘다.
+	const FVector ParticleScale(Settings.ParticleRadius / 50.0);
+
+	for (const FVector& Point : Result.Points)
 	{
-		return;
+		Transforms.Emplace(FQuat::Identity, Point, ParticleScale);
 	}
 
+	Modify();
+	Instances->Modify();
+	Instances->ClearInstances();
+	Instances->AddInstances(Transforms, /*bShouldReturnIndices=*/false,
+		/*bWorldSpace=*/false, /*bUpdateNavigation=*/false);
+
+	GeneratedCount = Instances->GetInstanceCount();
 	AppliedHalfExtents = Result.HalfExtents;
 	AppliedShape = Settings.Shape;
 
 	UE_LOG(LogSwarmShape, Display, TEXT("%s"), *LastReport);
 }
 
-FSwarmSamplingResult ASwarmShapePreview::GenerateReconstructionTargets() const
-{
-	FSwarmSamplingSettings ReconstructionSettings = Settings;
-	ReconstructionSettings.ParticleCount = SwarmRuntime->GetActiveParticleCount();
-
-	return FSwarmShapeSampler::GenerateTargets(ReconstructionSettings);
-}
-
-bool ASwarmShapePreview::ReconstructPreview()
-{
-	const FSwarmSamplingResult Result = GenerateReconstructionTargets();
-
-	if (!Result.bSuccess)
-	{
-		UE_LOG(LogSwarmShape, Warning, TEXT("Swarm reconstruction sampling failed for %s: %s"),
-			*GetName(), *Result.Message);
-		return false;
-	}
-
-	if (!SwarmRuntime->AssignReconstructionTargets(Result.Points))
-	{
-		UE_LOG(LogSwarmShape, Warning, TEXT("Swarm reconstruction targets were rejected for %s."),
-			*GetName());
-		return false;
-	}
-
-	const FVector PreviousHalfExtents = AppliedHalfExtents;
-
-	AppliedHalfExtents = Result.HalfExtents;
-	AppliedShape = Settings.Shape;
-
-	LastReport = FString::Printf(
-		TEXT("Reconstruction Active=%d HalfExtents(cm): %s -> %s Expansion=%.2f%%"),
-		SwarmRuntime->GetActiveParticleCount(),
-		*PreviousHalfExtents.ToString(),
-		*AppliedHalfExtents.ToString(),
-		Result.ExpansionRatio * 100.0);
-
-	UE_LOG(LogSwarmShape, Display, TEXT("%s: %s"), *GetName(), *LastReport);
-
-	return true;
-}
-
+// 미리보기 메시를 모두 지우고 Details의 생성 개수와 도형 크기를 0으로 갱신한다.
+// 에디터 변경 기록을 위해 Actor와 ISM에 Modify()를 호출한다.
 void ASwarmShapePreview::ClearPreview()
 {
 	Modify();
-	SwarmRuntime->ClearParticles();
+	Instances->Modify();
+	Instances->ClearInstances();
 
+	GeneratedCount = 0;
 	AppliedHalfExtents = FVector::ZeroVector;
 	LastReport = TEXT("Preview cleared.");
 }
 
+// 마지막 생성에서 구체 중심을 배치한 영역을 청록색 구나 박스로 10초간 표시한다.
+// 영역의 크기는 AppliedHalfExtents를 사용하고 위치와 회전은 Preview Actor를 따른다.
 void ASwarmShapePreview::ShowBounds()
 {
 	if (!GetWorld() || Instances->GetInstanceCount() == 0)
@@ -148,38 +111,4 @@ void ASwarmShapePreview::ShowBounds()
 	{
 		DrawDebugBox(GetWorld(), GetActorLocation(), AppliedHalfExtents, GetActorQuat(), FColor::Cyan, false, 10.0f);
 	}
-}
-
-bool ASwarmShapePreview::HighlightInstance(const UPrimitiveComponent* HitComponent, int32 InstanceIndex)
-{
-	if (!IsValid(Instances) || HitComponent != Instances.Get() || !GetWorld()
-		|| InstanceIndex < 0 || InstanceIndex >= Instances->GetInstanceCount())
-	{
-		return false;
-	}
-
-	const UStaticMesh* Mesh = Instances->GetStaticMesh();
-	FTransform WorldTransform;
-
-	if (!Mesh || !Instances->GetInstanceTransform(InstanceIndex, WorldTransform, true))
-	{
-		return false;
-	}
-
-	// 충돌 지점이 아닌 번호로 조회한 위치를 표시해야 번호 매핑을 검증할 수 있다.
-	// 현재 Settings는 재생성 전 값일 수 있으므로 실제 메시 크기와 인스턴스 Scale을 사용한다.
-	const FBoxSphereBounds Bounds = Mesh->GetBounds();
-	const FVector Center = WorldTransform.TransformPosition(Bounds.Origin);
-	const double Radius = Bounds.BoxExtent.GetMax() * WorldTransform.GetScale3D().GetAbsMax() * 1.1;
-
-	DrawDebugSphere(GetWorld(), Center, Radius, 24, FColor::Green, false, 2.0f, 0, 1.5f);
-
-	UE_LOG(LogSwarmShape, Display, TEXT("Highlight Instance=%d Center=%s"), InstanceIndex, *Center.ToString());
-
-	return true;
-}
-
-void ASwarmShapePreview::UpdateDisplayedActiveParticleCount(int32 NewCount)
-{
-	ActiveParticleCount = NewCount;
 }

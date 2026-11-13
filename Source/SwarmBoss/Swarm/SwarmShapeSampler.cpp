@@ -12,12 +12,14 @@
 
 namespace
 {
+	// 공간을 한 변이 CellSize인 정육면체로 나누었을 때 Point가 들어가는 셀의 X·Y·Z 정수 번호를 반환한다.
 	FIntVector CellFor(const FVector& Point, double CellSize)
 	{
 		return FIntVector(FMath::FloorToInt(Point.X / CellSize),
 			FMath::FloorToInt(Point.Y / CellSize), FMath::FloorToInt(Point.Z / CellSize));
 	}
 
+	// Random을 사용해 길이가 1인 무작위 방향 벡터를 반환한다. 구면의 특정 방향에 치우치지 않게 뽑는다.
 	FVector RandomDirection(FRandomStream& Random)
 	{
 		const double Z = Random.FRandRange(-1.0f, 1.0f);
@@ -27,6 +29,9 @@ namespace
 		return FVector(R * FMath::Cos(Angle), R * FMath::Sin(Angle), Z);
 	}
 
+	// Extents 크기의 도형 안에서 서로 Distance 이상 떨어진 구체 중심 좌표를 Points에 채운다.
+	// 검사한 후보 수를 Tests에 누적하며 MaxCandidateTests에 도달하면 false를 반환한다.
+	// true는 이 범위에서 점 생성을 마쳤다는 뜻이며, 요청 개수 충족 여부는 호출자가 확인한다.
 	bool GenerateAttempt(const FSwarmSamplingSettings& Settings, const FVector& Extents,
 		double Distance, FRandomStream& Random, int32& Tests, TArray<FVector>& Points)
 	{
@@ -34,6 +39,8 @@ namespace
 		TMap<FIntVector, TArray<int32>> Grid;
 		TArray<int32> Active;
 
+		// 새 좌표를 Points에 추가하고, 그 주변에서 다음 좌표를 찾도록 Active에 인덱스를 넣는다.
+		// 가까운 점을 검사할 때 찾을 수 있도록 Grid의 해당 셀에도 같은 인덱스를 등록한다.
 		auto Add = [&](const FVector& Point)
 		{
 			const int32 Index = Points.Add(Point);
@@ -112,6 +119,8 @@ namespace
 	}
 }
 
+// 원점을 중심으로 한 Shape 도형 안에 Point가 있는지 반환한다.
+// HalfExtents는 구에서는 X값이 반지름이고, 박스에서는 각 축의 반길이다.
 bool FSwarmShapeSampler::Contains(const FVector& Point, ESwarmPrimitive Shape, const FVector& HalfExtents)
 {
 	if (Point.ContainsNaN())
@@ -128,6 +137,8 @@ bool FSwarmShapeSampler::Contains(const FVector& Point, ESwarmPrimitive Shape, c
 		&& FMath::Abs(Point.Z) <= HalfExtents.Z;
 }
 
+// Points의 모든 좌표가 지정 도형 안에 있고, 모든 두 점 사이 거리가 MinimumDistance 이상인지 검사한다.
+// 실제 최소 거리를 OutMeasuredMinimum에 기록한다. 점이 0개나 1개이면 측정값은 0이다.
 bool FSwarmShapeSampler::ValidateTargets(const TArray<FVector>& Points, ESwarmPrimitive Shape,
 	const FVector& HalfExtents, double MinimumDistance, double& OutMeasuredMinimum)
 {
@@ -157,11 +168,14 @@ bool FSwarmShapeSampler::ValidateTargets(const TArray<FVector>& Points, ESwarmPr
 	return true;
 }
 
+// S.ParticleCount와 구체 간 최소 간격으로 도형 크기를 계산하고, 도형 중심 기준의 구체 좌표를 생성한다.
+// 점이 부족하면 허용 범위 내에서 도형을 확대해 재시도한다. 반환 결과의 bSuccess로 성공 여부를 확인한다.
 FSwarmSamplingResult FSwarmShapeSampler::GenerateTargets(const FSwarmSamplingSettings& S)
 {
 	FSwarmSamplingResult Result;
 	const double Start = FPlatformTime::Seconds();
 
+	// Result에 생성 성공·실패의 설명과 함수 시작 후 경과 시간을 채워 반환한다.
 	auto Finish = [&](const FString& Message)
 	{
 		Result.Message = Message;
