@@ -55,7 +55,7 @@ protected:
 	// 왼쪽 클릭으로 화면 중앙의 구체 하나를 제거한다. 조준선은 HUD가 표시한다.
 	void TraceSwarmParticle();
 
-	// T 키로 레벨의 Manager마다 몸통:왼팔 생존 수를 2:1로 맞추고 새 도형 목표로 이동시킨다.
+	// T 키로 레벨의 Manager마다 몸통·왼팔 생존 수를 형태 데이터의 가중치 비율로 맞추고 새 도형 목표로 이동시킨다.
 	void RebalanceSwarmPartsForTest();
 
 	/** Returns true if the player should use UMG touch controls */

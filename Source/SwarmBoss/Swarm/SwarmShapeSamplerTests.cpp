@@ -12,10 +12,66 @@
 #include "UObject/UnrealType.h"
 #include <limits>
 #include "Boss/SwarmBossManager.h"
+#include "Boss/SwarmFormDefinition.h"
 #include "SwarmShapePreview.h"
 #include "Components/InstancedStaticMeshComponent.h"
 #include "Engine/World.h"
 #include "Engine/StaticMesh.h"
+
+namespace
+{
+	// 기존 코드 기본값과 같은 몸통:왼팔 2:1 형태 데이터를 임시 패키지에 만든다.
+	// 몸통은 최상위 부위이며 박스 비율 (1, 0.75, 1.5), 왼팔은 몸통의 자식이며 (0.45, 0.45, 1)이다.
+	USwarmFormDefinition* CreateTwoPartDefinition()
+	{
+		USwarmFormDefinition* Definition = NewObject<USwarmFormDefinition>(GetTransientPackage());
+
+		FSwarmPartDefinition& Torso = Definition->Parts.AddDefaulted_GetRef();
+		Torso.PartId = ESwarmPartId::Torso;
+		Torso.ParentPartId = ESwarmPartId::None;
+		Torso.Shape = ESwarmPrimitive::Box;
+		Torso.BoxHalfExtentsRatio = FVector(1.0, 0.75, 1.5);
+		Torso.AllocationWeight = 2;
+
+		FSwarmPartDefinition& LeftArm = Definition->Parts.AddDefaulted_GetRef();
+		LeftArm.PartId = ESwarmPartId::LeftArm;
+		LeftArm.ParentPartId = ESwarmPartId::Torso;
+		LeftArm.Shape = ESwarmPrimitive::Box;
+		LeftArm.BoxHalfExtentsRatio = FVector(0.45, 0.45, 1.0);
+		LeftArm.AllocationWeight = 1;
+
+		return Definition;
+	}
+
+	// World에 Manager를 생성하고 몸통:왼팔 2:1 형태 데이터를 지정한다. 구체는 아직 생성하지 않는다.
+	ASwarmBossManager* SpawnTwoPartManager(UWorld* World)
+	{
+		ASwarmBossManager* Boss = World->SpawnActor<ASwarmBossManager>();
+
+		if (Boss)
+		{
+			Boss->SetFormDefinition(CreateTwoPartDefinition());
+		}
+
+		return Boss;
+	}
+
+	// Manager의 활성 구체 중 소속이 PartId인 개수를 센다.
+	int32 CountActivePartParticles(const ASwarmBossManager& Boss, ESwarmPartId PartId)
+	{
+		int32 Count = 0;
+
+		for (const FSwarmParticle& Particle : Boss.GetParticles())
+		{
+			if (Particle.bActive && Particle.PartId == PartId)
+			{
+				++Count;
+			}
+		}
+
+		return Count;
+	}
+}
 
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(FSwarmSamplingInvariantTest, "SwarmBoss.Stage1.SamplingInvariants",
 	EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
@@ -192,7 +248,7 @@ bool FSwarmManagerBehaviorTest::RunTest(const FString& Parameters)
 		return false;
 	}
 
-	ASwarmBossManager* Boss = World->SpawnActor<ASwarmBossManager>();
+	ASwarmBossManager* Boss = SpawnTwoPartManager(World);
 	if (TestNotNull(TEXT("Boss manager"), Boss))
 	{
 		FSwarmSamplingSettings Settings;
@@ -502,7 +558,7 @@ bool FSwarmTwoPartRemovalTest::RunTest(const FString& Parameters)
 		return false;
 	}
 
-	ASwarmBossManager* Boss = World->SpawnActor<ASwarmBossManager>();
+	ASwarmBossManager* Boss = SpawnTwoPartManager(World);
 
 	if (!TestNotNull(TEXT("Boss manager"), Boss) ||
 		!TestTrue(TEXT("Both parts generate"), Boss->GenerateInitialParts()))
@@ -658,7 +714,7 @@ bool FSwarmPartTransferTest::RunTest(const FString& Parameters)
 		return false;
 	}
 
-	ASwarmBossManager* Boss = World->SpawnActor<ASwarmBossManager>();
+	ASwarmBossManager* Boss = SpawnTwoPartManager(World);
 	if (!TestNotNull(TEXT("Manager"), Boss) || !TestTrue(TEXT("Generate parts"), Boss->GenerateInitialParts()))
 	{
 		World->DestroyWorld(false);
@@ -765,7 +821,7 @@ bool FSwarmTransferBatchTest::RunTest(const FString& Parameters)
 		return false;
 	}
 
-	ASwarmBossManager* Boss = World->SpawnActor<ASwarmBossManager>();
+	ASwarmBossManager* Boss = SpawnTwoPartManager(World);
 	if (!TestNotNull(TEXT("Manager"), Boss) || !TestTrue(TEXT("Generate parts"), Boss->GenerateInitialParts()))
 	{
 		World->DestroyWorld(false);
@@ -900,7 +956,7 @@ bool FSwarmRebalanceTest::RunTest(const FString& Parameters)
 		return false;
 	}
 
-	ASwarmBossManager* Boss = World->SpawnActor<ASwarmBossManager>();
+	ASwarmBossManager* Boss = SpawnTwoPartManager(World);
 	if (!TestNotNull(TEXT("Manager"), Boss) || !TestTrue(TEXT("Generate initial parts"), Boss->GenerateInitialParts()))
 	{
 		World->DestroyWorld(false);
@@ -937,7 +993,8 @@ bool FSwarmRebalanceTest::RunTest(const FString& Parameters)
 		return false;
 	}
 
-	TestFalse(TEXT("Invalid weights rejected"), Boss->RebalanceParts(ESwarmPartId::Torso, ESwarmPartId::LeftArm, 0, 1));
+	TestFalse(TEXT("Negative weight rejected"), Boss->RebalanceParts(ESwarmPartId::Torso, ESwarmPartId::LeftArm, -1, 1));
+	TestFalse(TEXT("Zero weight sum rejected"), Boss->RebalanceParts(ESwarmPartId::Torso, ESwarmPartId::LeftArm, 0, 0));
 	TestTrue(TEXT("Initial balanced state succeeds"), Boss->RebalanceParts(ESwarmPartId::Torso, ESwarmPartId::LeftArm, 2, 1));
 	TestEqual(TEXT("Initial torso stays at sixty"), Torso->GetInstanceCount(), 60);
 	TestEqual(TEXT("Initial arm stays at thirty"), Arm->GetInstanceCount(), 30);
@@ -1001,7 +1058,7 @@ bool FSwarmTimedReconstructionTest::RunTest(const FString& Parameters)
 		return false;
 	}
 
-	ASwarmBossManager* Boss = World->SpawnActor<ASwarmBossManager>();
+	ASwarmBossManager* Boss = SpawnTwoPartManager(World);
 	if (!TestNotNull(TEXT("Manager"), Boss) || !TestTrue(TEXT("Generate parts"), Boss->GenerateInitialParts()))
 	{
 		World->DestroyWorld(false);
@@ -1107,6 +1164,151 @@ bool FSwarmTimedReconstructionTest::RunTest(const FString& Parameters)
 	TestFalse(TEXT("Zero reconstruction duration rejected"), Boss->RebalanceParts(
 		ESwarmPartId::Torso, ESwarmPartId::LeftArm, 2, 1));
 	TestEqual(TEXT("Rejected duration preserves active count"), Boss->GetActiveParticleCount(), 89);
+
+	World->DestroyWorld(false);
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FSwarmFormDefinitionTest, "SwarmBoss.Stage2.FormDefinition",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+// 형태 데이터에 따른 초기 생성을 검증한다. 데이터 누락은 생성하지 않고, 가중치 비율과 잔여 배정을 따르며,
+// 잘못된 데이터는 경고와 함께 거절하고 이미 생성된 구체를 유지해야 한다.
+bool FSwarmFormDefinitionTest::RunTest(const FString& Parameters)
+{
+	UWorld* World = UWorld::CreateWorld(EWorldType::Game, false);
+
+	if (!TestNotNull(TEXT("Transient world"), World))
+	{
+		return false;
+	}
+
+	ASwarmBossManager* Boss = World->SpawnActor<ASwarmBossManager>();
+
+	if (!TestNotNull(TEXT("Manager"), Boss))
+	{
+		World->DestroyWorld(false);
+		return false;
+	}
+
+	AddExpectedError(TEXT("FormDefinition is not assigned"), EAutomationExpectedErrorFlags::Contains, 1);
+	TestFalse(TEXT("Missing definition is rejected"), Boss->GenerateInitialParts());
+	TestEqual(TEXT("Missing definition creates no particles"), Boss->GetParticles().Num(), 0);
+
+	// 기본 전체 90개를 몸통:왼팔 3:4로 나누면 버림 결과는 38(38.57)과 51(51.43)이다.
+	// 버림으로 남은 1개는 잔여 수신 부위인 몸통으로 가서 39개가 된다.
+	USwarmFormDefinition* WeightedDefinition = CreateTwoPartDefinition();
+	WeightedDefinition->Parts[0].AllocationWeight = 3;
+	WeightedDefinition->Parts[1].AllocationWeight = 4;
+	Boss->SetFormDefinition(WeightedDefinition);
+
+	if (TestTrue(TEXT("Custom weights generate"), Boss->GenerateInitialParts()))
+	{
+		TestEqual(TEXT("Torso receives share and remainder"), CountActivePartParticles(*Boss, ESwarmPartId::Torso), 39);
+		TestEqual(TEXT("Arm receives floored share"), CountActivePartParticles(*Boss, ESwarmPartId::LeftArm), 51);
+	}
+
+	// 가중치 0인 왼팔은 비율 배분을 받지 않으며 전체가 몸통에 배정된다.
+	USwarmFormDefinition* ZeroArmDefinition = CreateTwoPartDefinition();
+	ZeroArmDefinition->Parts[1].AllocationWeight = 0;
+	Boss->SetFormDefinition(ZeroArmDefinition);
+
+	if (TestTrue(TEXT("Zero weight part generates"), Boss->GenerateInitialParts()))
+	{
+		TestEqual(TEXT("Zero weight arm stays empty"), CountActivePartParticles(*Boss, ESwarmPartId::LeftArm), 0);
+		TestEqual(TEXT("Torso receives every particle"), CountActivePartParticles(*Boss, ESwarmPartId::Torso), 90);
+	}
+
+	// 각 잘못된 데이터는 해당 원인의 경고를 남기고 실패하며, 직전에 생성한 90개를 그대로 유지해야 한다.
+	struct FInvalidCase
+	{
+		const TCHAR* Name;
+		const TCHAR* ExpectedLog;
+		TFunction<void(USwarmFormDefinition&)> Modify;
+	};
+
+	const FInvalidCase InvalidCases[] =
+	{
+		{TEXT("Duplicate part"), TEXT("is defined more than once"),
+			[](USwarmFormDefinition& D) { D.Parts[1].PartId = ESwarmPartId::Torso; }},
+		{TEXT("None part"), TEXT("cannot be used as a part"),
+			[](USwarmFormDefinition& D) { D.Parts[1].PartId = ESwarmPartId::None; }},
+		{TEXT("Part without instance component"), TEXT("has no instance component"),
+			[](USwarmFormDefinition& D) { D.Parts[1].PartId = ESwarmPartId::Head; }},
+		{TEXT("Missing manager part"), TEXT("Every part owned by the manager must be defined"),
+			[](USwarmFormDefinition& D) { D.Parts.RemoveAt(1); }},
+		{TEXT("Negative weight"), TEXT("negative allocation weight"),
+			[](USwarmFormDefinition& D) { D.Parts[1].AllocationWeight = -1; }},
+		{TEXT("Zero weight sum"), TEXT("must sum to a positive value"),
+			[](USwarmFormDefinition& D) { D.Parts[0].AllocationWeight = 0; D.Parts[1].AllocationWeight = 0; }},
+		{TEXT("Non-positive box ratio"), TEXT("box ratio must be finite and positive"),
+			[](USwarmFormDefinition& D) { D.Parts[1].BoxHalfExtentsRatio = FVector(0.45, 0.0, 1.0); }},
+		{TEXT("Non-finite pose"), TEXT("relative pose must be finite"),
+			[](USwarmFormDefinition& D) { D.Parts[1].RelativeLocation.X = std::numeric_limits<double>::quiet_NaN(); }},
+		{TEXT("Self parent"), TEXT("cannot be its own parent"),
+			[](USwarmFormDefinition& D) { D.Parts[1].ParentPartId = ESwarmPartId::LeftArm; }},
+		{TEXT("Undefined parent"), TEXT("refers to an undefined parent"),
+			[](USwarmFormDefinition& D) { D.Parts[1].ParentPartId = ESwarmPartId::Head; }},
+		{TEXT("Non-torso root"), TEXT("Only the torso can have no parent"),
+			[](USwarmFormDefinition& D) { D.Parts[0].ParentPartId = ESwarmPartId::LeftArm; D.Parts[1].ParentPartId = ESwarmPartId::None; }},
+		{TEXT("Remainder outside parts"), TEXT("RemainderPartId must be one of the defined parts"),
+			[](USwarmFormDefinition& D) { D.RemainderPartId = ESwarmPartId::Head; }},
+	};
+
+	for (const FInvalidCase& InvalidCase : InvalidCases)
+	{
+		USwarmFormDefinition* Definition = CreateTwoPartDefinition();
+		InvalidCase.Modify(*Definition);
+		Boss->SetFormDefinition(Definition);
+
+		AddExpectedError(InvalidCase.ExpectedLog, EAutomationExpectedErrorFlags::Contains, 1);
+		TestFalse(FString::Printf(TEXT("%s is rejected"), InvalidCase.Name), Boss->GenerateInitialParts());
+		TestEqual(FString::Printf(TEXT("%s preserves existing particles"), InvalidCase.Name),
+			Boss->GetActiveParticleCount(), 90);
+	}
+
+	// T 재분배도 입력 시점의 형태 데이터 가중치를 읽어야 한다. 3:4로 39/51을 만든 뒤 왼팔 6개를 제거하면 39/45가 된다.
+	// 합계 84를 3:4로 나누면 왼팔 48(버림), 몸통 36이므로 몸통에서 왼팔로 3개가 이동한다.
+	Boss->SetFormDefinition(WeightedDefinition);
+	UInstancedStaticMeshComponent* Arm = nullptr;
+
+	for (UInstancedStaticMeshComponent* Part : TInlineComponentArray<UInstancedStaticMeshComponent*>(Boss))
+	{
+		if (Part->GetFName() == TEXT("LeftArmInstances"))
+		{
+			Arm = Part;
+		}
+	}
+
+	if (TestNotNull(TEXT("Arm component"), Arm) && TestTrue(TEXT("Regenerate weighted parts"), Boss->GenerateInitialParts()))
+	{
+		for (int32 Index = 0; Index < 6; ++Index)
+		{
+			TestTrue(TEXT("Remove arm particle"), Boss->RemoveInstance(Arm, 0));
+		}
+
+		TestTrue(TEXT("Definition rebalance succeeds"), Boss->RebalancePartsFromDefinition());
+		TestEqual(TEXT("Definition rebalance torso"), CountActivePartParticles(*Boss, ESwarmPartId::Torso), 36);
+		TestEqual(TEXT("Definition rebalance arm"), CountActivePartParticles(*Boss, ESwarmPartId::LeftArm), 48);
+
+		// 생성 후 데이터를 2:1로 바꾸면 다음 재분배부터 새 가중치를 사용한다. 84개는 56/28이다.
+		Boss->SetFormDefinition(CreateTwoPartDefinition());
+		TestTrue(TEXT("Changed weights rebalance"), Boss->RebalancePartsFromDefinition());
+		TestEqual(TEXT("Changed weights torso"), CountActivePartParticles(*Boss, ESwarmPartId::Torso), 56);
+		TestEqual(TEXT("Changed weights arm"), CountActivePartParticles(*Boss, ESwarmPartId::LeftArm), 28);
+
+		// 가중치 0인 왼팔은 재분배 시 모든 구체를 몸통으로 보낸다.
+		Boss->SetFormDefinition(ZeroArmDefinition);
+		TestTrue(TEXT("Zero weight rebalance"), Boss->RebalancePartsFromDefinition());
+		TestEqual(TEXT("Zero weight arm empties"), CountActivePartParticles(*Boss, ESwarmPartId::LeftArm), 0);
+		TestEqual(TEXT("Zero weight torso receives all"), CountActivePartParticles(*Boss, ESwarmPartId::Torso), 84);
+
+		// 데이터가 없으면 재분배하지 않고 기존 소속을 유지한다.
+		Boss->SetFormDefinition(nullptr);
+		AddExpectedError(TEXT("FormDefinition is not assigned"), EAutomationExpectedErrorFlags::Contains, 1);
+		TestFalse(TEXT("Missing definition rebalance rejected"), Boss->RebalancePartsFromDefinition());
+		TestEqual(TEXT("Missing definition preserves torso"), CountActivePartParticles(*Boss, ESwarmPartId::Torso), 84);
+	}
 
 	World->DestroyWorld(false);
 	return true;

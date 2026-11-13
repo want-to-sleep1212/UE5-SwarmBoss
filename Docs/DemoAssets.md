@@ -20,6 +20,14 @@
 
 `.gitignore`의 Content 허용 목록으로 불필요한 에셋의 재추가를 방지한다. 새 에셋을 데모에서 사용하면 참조 관계를 다시 확인하고 허용 목록과 의존성 문서를 함께 갱신해야 한다. 단순 `git add .`만으로 신규 Content가 자동 포함되지 않는다.
 
+## 이후 추가한 에셋
+
+| 에셋 | 추가일 | 추적 이유 |
+|---|---|---|
+| `/Game/Data/DA_GiantForm` (`Content/Data/DA_GiantForm.uasset`) | 2026-11-14 | `SwarmBossManager`의 `Form Definition`에 지정하는 거인 형태 데이터. 비어 있으면 Manager가 구체를 생성하지 않는다. `/Script` 클래스 외 다른 Content 의존은 없다. |
+
+`DA_GiantForm`은 Asset Registry 재귀 조사로 찾은 것이 아니라 허용 목록에 직접 추가했다. 레벨에 배치한 `SwarmBossManager` 외부 Actor 파일은 허용 목록에 없어 추적하지 않으므로, 추적 중인 레벨 파일은 이 에셋을 참조하지 않는다. 새로 받은 저장소에서는 Manager를 배치하고 이 에셋을 지정해야 한다. [DemoAssetDependencies.json](DemoAssetDependencies.json)은 2026-11-10 조사 결과이며 이번 추가로 다시 생성하지 않았다.
+
 ## 검증과 한계
 
 원본 프로젝트의 에셋을 삭제하지 않고, 필요한 86개만 복사한 독립 검증 프로젝트를 만들었다. 해당 프로젝트에는 기존 Intermediate·Asset Registry 캐시를 복사하지 않았다. UE 5.7.4 Python commandlet으로 데모 맵과 플레이어 Blueprint 3개를 로드했고, 오류·경고 0개로 완료했다. 로드한 레벨에서 Actor 19개와 SwarmShapePreview 1개를 확인했다.

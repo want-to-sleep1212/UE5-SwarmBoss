@@ -95,6 +95,7 @@ Desktop.ini
 !/Content/FirstPerson/Blueprints/BP_FirstPersonGameMode.uasset
 !/Content/FirstPerson/Blueprints/BP_FirstPersonPlayerController.uasset
 !/Content/FirstPerson/Lvl_FirstPerson.umap
+!/Content/Data/DA_GiantForm.uasset
 !/Content/Input/Actions/IA_Jump.uasset
 !/Content/Input/Actions/IA_Look.uasset
 !/Content/Input/Actions/IA_MouseLook.uasset

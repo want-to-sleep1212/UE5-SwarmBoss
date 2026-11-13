@@ -3,10 +3,41 @@
 #include "Components/InstancedStaticMeshComponent.h"
 #include "Components/SceneComponent.h"
 #include "Engine/StaticMesh.h"
+#include "Boss/SwarmFormDefinition.h"
 #include "Swarm/SwarmShapeSampler.h"
 #include "UObject/ConstructorHelpers.h"
 
 DEFINE_LOG_CATEGORY_STATIC(LogSwarmBossManager, Log, All);
+
+namespace
+{
+	// TotalCount를 Definition.Parts의 AllocationWeight 비율로 나눈 부위별 구체 수를 반환한다.
+	// 각 부위는 TotalCount × 가중치 / 가중치 합을 정수로 버림한 수를 받고, 버림으로 남은 수는 RemainderPartId 부위에 더한다.
+	// 가중치 합이 0보다 크고 RemainderPartId가 Parts 안에 있다는 검증을 마친 데이터만 전달해야 한다.
+	TMap<ESwarmPartId, int32> AllocatePartCounts(const USwarmFormDefinition& Definition, int32 TotalCount)
+	{
+		int64 WeightSum = 0;
+
+		for (const FSwarmPartDefinition& Part : Definition.Parts)
+		{
+			WeightSum += Part.AllocationWeight;
+		}
+
+		TMap<ESwarmPartId, int32> Counts;
+		int32 AllocatedCount = 0;
+
+		for (const FSwarmPartDefinition& Part : Definition.Parts)
+		{
+			const int32 Count = static_cast<int32>(static_cast<int64>(TotalCount) * Part.AllocationWeight / WeightSum);
+			Counts.Add(Part.PartId, Count);
+			AllocatedCount += Count;
+		}
+
+		Counts.FindChecked(Definition.RemainderPartId) += TotalCount - AllocatedCount;
+
+		return Counts;
+	}
+}
 
 // 몸통과 왼팔의 구체 메시를 표시하고 충돌을 조회할 ISM(UInstancedStaticMeshComponent)을 각각 만든다.
 // Parts에 부위별 ISM을 등록하고, 이동 목표가 있을 때만 Actor Tick을 사용하도록 설정한다.
@@ -47,10 +78,11 @@ void ASwarmBossManager::BeginPlay()
 	GenerateInitialParts();
 }
 
-// InitialParticleCount를 몸통:왼팔 2:1로 나눠 각 도형 중심 기준의 구체 좌표를 계산한다.
-// 왼팔은 전체의 1/3을 정수로 버림하고 나머지는 몸통에 배정한다. 초기 설정값은 생존 수와 별도로 유지한다.
-// 양쪽 계산이 성공하면 구체를 생성하고, 생성 크기와 PartGap으로 왼팔 위치를 정해 두 도형을 분리한다.
-// 성공한 설정은 부위별로 보관한다. 잘못된 설정이나 생성 실패는 기존 상태를 유지하고 false를 반환한다.
+// FormDefinition의 부위 목록에 따라 InitialParticleCount를 가중치 비율로 나누고, 부위마다 도형 중심 기준의 구체 좌표를 계산한다.
+// 정수 배분의 나머지는 RemainderPartId 부위가 받는다. 초기 설정값은 생존 수와 별도로 유지한다.
+// 모든 부위의 계산이 성공하면 구체를 생성하고, 생성 크기와 PartGap으로 왼팔 위치를 정해 두 도형을 분리한다.
+// 데이터의 RelativeLocation·RelativeRotation은 아직 적용하지 않는다. 축소 후 연결 위치 계산 방식을 정한 뒤 사용한다.
+// 성공한 설정은 부위별로 보관한다. 데이터 누락·잘못된 설정·생성 실패는 기존 상태를 유지하고 false를 반환한다.
 bool ASwarmBossManager::GenerateInitialParts()
 {
 	if (InitialParticleCount < 0 || InitialParticleCount > 10000)
@@ -65,45 +97,194 @@ bool ASwarmBossManager::GenerateInitialParts()
 		return false;
 	}
 
-	const int32 LeftArmCount = InitialParticleCount / 3;
-	const int32 TorsoCount = InitialParticleCount - LeftArmCount;
-
-	FSwarmSamplingSettings TorsoSettings;
-	TorsoSettings.Shape = ESwarmPrimitive::Box;
-	TorsoSettings.BoxHalfExtents = FVector(1.0, 0.75, 1.5);
-	TorsoSettings.ParticleCount = TorsoCount;
-
-	FSwarmSamplingSettings LeftArmSettings = TorsoSettings;
-	LeftArmSettings.BoxHalfExtents = FVector(0.45, 0.45, 1.0);
-	LeftArmSettings.ParticleCount = LeftArmCount;
-
-	const FSwarmSamplingResult Torso = FSwarmShapeSampler::GenerateTargets(TorsoSettings);
-	const FSwarmSamplingResult LeftArm = FSwarmShapeSampler::GenerateTargets(LeftArmSettings);
-
-	if (!Torso.bSuccess || !LeftArm.bSuccess)
+	if (!FormDefinition)
 	{
-		UE_LOG(LogSwarmBossManager, Warning, TEXT("Initial sampling failed for %s. Torso=%s LeftArm=%s"),
-			*GetName(), *Torso.Message, *LeftArm.Message);
+		UE_LOG(LogSwarmBossManager, Warning, TEXT("FormDefinition is not assigned on %s."), *GetName());
 		return false;
 	}
 
-	const FSwarmPartPlacement Placements[] =
+	if (!ValidateFormDefinition(*FormDefinition))
 	{
-		{ESwarmPartId::Torso, Torso.Points},
-		{ESwarmPartId::LeftArm, LeftArm.Points}
-	};
+		return false;
+	}
+
+	const TMap<ESwarmPartId, int32> PartCounts = AllocatePartCounts(*FormDefinition, InitialParticleCount);
+
+	// 모든 부위의 샘플링이 성공할 때까지 저장소와 ISM을 건드리지 않도록 결과를 먼저 모은다.
+	TMap<ESwarmPartId, FSwarmSamplingSettings> PartSettings;
+	TMap<ESwarmPartId, FSwarmSamplingResult> PartResults;
+
+	for (const FSwarmPartDefinition& PartDefinition : FormDefinition->Parts)
+	{
+		FSwarmSamplingSettings Settings;
+		Settings.Shape = PartDefinition.Shape;
+		Settings.BoxHalfExtents = PartDefinition.BoxHalfExtentsRatio;
+		Settings.ParticleCount = PartCounts.FindChecked(PartDefinition.PartId);
+
+		FSwarmSamplingResult Result = FSwarmShapeSampler::GenerateTargets(Settings);
+
+		if (!Result.bSuccess)
+		{
+			UE_LOG(LogSwarmBossManager, Warning, TEXT("Initial sampling failed for %s part %s: %s"),
+				*GetName(), *UEnum::GetValueAsString(PartDefinition.PartId), *Result.Message);
+			return false;
+		}
+
+		PartSettings.Add(PartDefinition.PartId, Settings);
+		PartResults.Add(PartDefinition.PartId, MoveTemp(Result));
+	}
+
+	TArray<FSwarmPartPlacement> Placements;
+	Placements.Reserve(PartResults.Num());
+
+	for (const FSwarmPartDefinition& PartDefinition : FormDefinition->Parts)
+	{
+		Placements.Add(FSwarmPartPlacement{PartDefinition.PartId, PartResults.FindChecked(PartDefinition.PartId).Points});
+	}
+
+	const FSwarmSamplingSettings& TorsoSettings = PartSettings.FindChecked(ESwarmPartId::Torso);
 
 	if (!InitializeParticles(Placements, TorsoSettings.ParticleRadius))
 	{
 		return false;
 	}
 
-	Parts.FindChecked(ESwarmPartId::Torso).SamplingSettings = TorsoSettings;
-	Parts.FindChecked(ESwarmPartId::LeftArm).SamplingSettings = LeftArmSettings;
+	for (const TPair<ESwarmPartId, FSwarmSamplingSettings>& Pair : PartSettings)
+	{
+		Parts.FindChecked(Pair.Key).SamplingSettings = Pair.Value;
+	}
 
-	const double CenterDistance = Torso.HalfExtents.Y + LeftArm.HalfExtents.Y
+	const FSwarmSamplingSettings& LeftArmSettings = PartSettings.FindChecked(ESwarmPartId::LeftArm);
+	const double CenterDistance = PartResults.FindChecked(ESwarmPartId::Torso).HalfExtents.Y
+		+ PartResults.FindChecked(ESwarmPartId::LeftArm).HalfExtents.Y
 		+ TorsoSettings.ParticleRadius + LeftArmSettings.ParticleRadius + PartGap;
 	LeftArmInstances->SetRelativeLocation(FVector(0.0, -CenterDistance, 15.0));
+
+	return true;
+}
+
+// 초기 생성에 사용할 형태 데이터를 교체한다. 유효성은 다음 GenerateInitialParts() 호출 때 검사한다.
+void ASwarmBossManager::SetFormDefinition(USwarmFormDefinition* NewFormDefinition)
+{
+	FormDefinition = NewFormDefinition;
+}
+
+// Definition을 이 Manager가 생성할 수 있는지 검사한다. 문제가 있으면 첫 번째 원인을 경고 로그로 남기고 false를 반환한다.
+// 검사 항목: 부위 ID 유일성과 None/Preview 금지, 이 Manager에 ISM이 있는 부위를 빠짐없이 정의했는지,
+// 가중치가 0 이상이고 합이 0보다 큰지, 종횡비·자세 값의 유효성, 부모가 같은 목록 안에 있는지,
+// 부모 없는 최상위 부위가 몸통 하나뿐인지, 순환 연결이 없는지, 잔여 수신 부위가 목록 안에 있는지.
+// 에디터의 Clamp 메타데이터는 코드·잘못된 에셋으로 들어온 값을 막지 못하므로 여기서 다시 검사한다.
+bool ASwarmBossManager::ValidateFormDefinition(const USwarmFormDefinition& Definition) const
+{
+	auto Fail = [this, &Definition](const FString& Reason)
+	{
+		UE_LOG(LogSwarmBossManager, Warning, TEXT("Invalid FormDefinition %s for %s: %s"),
+			*Definition.GetName(), *GetName(), *Reason);
+		return false;
+	};
+
+	TMap<ESwarmPartId, ESwarmPartId> ParentOf;
+	int64 WeightSum = 0;
+
+	for (const FSwarmPartDefinition& Part : Definition.Parts)
+	{
+		const FString PartName = UEnum::GetValueAsString(Part.PartId);
+
+		if (Part.PartId == ESwarmPartId::None || Part.PartId == ESwarmPartId::Preview)
+		{
+			return Fail(FString::Printf(TEXT("%s cannot be used as a part."), *PartName));
+		}
+
+		if (ParentOf.Contains(Part.PartId))
+		{
+			return Fail(FString::Printf(TEXT("%s is defined more than once."), *PartName));
+		}
+
+		if (!Parts.Contains(Part.PartId))
+		{
+			return Fail(FString::Printf(TEXT("%s has no instance component in this manager."), *PartName));
+		}
+
+		if (Part.AllocationWeight < 0)
+		{
+			return Fail(FString::Printf(TEXT("%s has a negative allocation weight."), *PartName));
+		}
+
+		if (Part.BoxHalfExtentsRatio.ContainsNaN() || Part.BoxHalfExtentsRatio.GetMin() <= 0.0)
+		{
+			return Fail(FString::Printf(TEXT("%s box ratio must be finite and positive."), *PartName));
+		}
+
+		if (Part.RelativeLocation.ContainsNaN() || Part.RelativeRotation.ContainsNaN())
+		{
+			return Fail(FString::Printf(TEXT("%s relative pose must be finite."), *PartName));
+		}
+
+		if (Part.ParentPartId == Part.PartId)
+		{
+			return Fail(FString::Printf(TEXT("%s cannot be its own parent."), *PartName));
+		}
+
+		ParentOf.Add(Part.PartId, Part.ParentPartId);
+		WeightSum += Part.AllocationWeight;
+	}
+
+	if (ParentOf.Num() != Parts.Num())
+	{
+		return Fail(TEXT("Every part owned by the manager must be defined."));
+	}
+
+	if (WeightSum <= 0)
+	{
+		return Fail(TEXT("Allocation weights must sum to a positive value."));
+	}
+
+	if (!ParentOf.Contains(Definition.RemainderPartId))
+	{
+		return Fail(TEXT("RemainderPartId must be one of the defined parts."));
+	}
+
+	int32 RootCount = 0;
+
+	for (const TPair<ESwarmPartId, ESwarmPartId>& Pair : ParentOf)
+	{
+		if (Pair.Value == ESwarmPartId::None)
+		{
+			++RootCount;
+
+			if (Pair.Key != ESwarmPartId::Torso)
+			{
+				return Fail(TEXT("Only the torso can have no parent."));
+			}
+		}
+		else if (!ParentOf.Contains(Pair.Value))
+		{
+			return Fail(FString::Printf(TEXT("%s refers to an undefined parent."), *UEnum::GetValueAsString(Pair.Key)));
+		}
+	}
+
+	if (RootCount != 1)
+	{
+		return Fail(TEXT("Exactly one root part (the torso) is required."));
+	}
+
+	// 각 부위에서 부모를 따라 올라가 부위 수 이내에 최상위에 도달하지 못하면 순환 연결로 판단한다.
+	for (const TPair<ESwarmPartId, ESwarmPartId>& Pair : ParentOf)
+	{
+		ESwarmPartId Current = Pair.Key;
+		int32 Steps = 0;
+
+		while (Current != ESwarmPartId::None && Steps <= ParentOf.Num())
+		{
+			Current = ParentOf.FindChecked(Current);
+			++Steps;
+		}
+
+		if (Current != ESwarmPartId::None)
+		{
+			return Fail(FString::Printf(TEXT("%s is part of a parent cycle."), *UEnum::GetValueAsString(Pair.Key)));
+		}
+	}
 
 	return true;
 }
@@ -469,7 +650,8 @@ int32 ASwarmBossManager::TransferParticlesToTargets(ESwarmPartId SourcePartId, E
 }
 
 // 두 부위의 현재 생존 수 합계를 FirstWeight:SecondWeight로 나눠 초과 부위에서 부족 부위로 전달한다.
-// 두 번째 부위의 목표 개수는 정수로 버림하고 나머지는 첫 번째 부위에 배정한다. 비율은 모두 양수여야 한다.
+// 두 번째 부위의 목표 개수는 정수로 버림하고 나머지는 첫 번째 부위에 배정한다.
+// 가중치는 0 이상이고 합이 양수여야 한다. 가중치 0인 부위는 구체를 모두 다른 부위로 보낸다.
 // 각 부위의 초기 생성 설정에서 개수만 바꿔 새 좌표를 생성한 뒤, 소속 변경과 양쪽 전체 목표 배정을 수행한다.
 // 새 목표는 배정 시점의 현재 위치에서 ReconstructionDuration초 동안 이동하도록 설정한다.
 // 재구성 시간이 유효한 양수가 아니면 거부한다. 현재 개수가 이미 목표와 같으면 아무것도 바꾸지 않는다.
@@ -486,7 +668,7 @@ bool ASwarmBossManager::RebalanceParts(ESwarmPartId FirstPartId, ESwarmPartId Se
 
 	FSwarmPart* PartPair[] = {Parts.Find(FirstPartId), Parts.Find(SecondPartId)};
 
-	if (FirstPartId == SecondPartId || FirstWeight <= 0 || SecondWeight <= 0
+	if (FirstPartId == SecondPartId || FirstWeight < 0 || SecondWeight < 0 || int64(FirstWeight) + SecondWeight <= 0
 		|| !PartPair[0] || !PartPair[1]
 		|| !IsValid(PartPair[0]->Instances) || !IsValid(PartPair[1]->Instances))
 	{
@@ -559,6 +741,41 @@ bool ASwarmBossManager::RebalanceParts(ESwarmPartId FirstPartId, ESwarmPartId Se
 	}
 
 	return true;
+}
+
+// T 입력 시점의 FormDefinition에서 부위별 AllocationWeight를 읽어 RebalanceParts()에 전달한다.
+// RemainderPartId 부위를 첫 번째 부위로 넘겨 버림 나머지를 받게 하므로 초기 생성과 같은 배분 규칙을 따른다.
+// 가중치만 다시 읽으며, 도형 종류·종횡비는 마지막 초기 생성 때 보관한 설정을 그대로 사용한다.
+// 데이터가 없거나 유효하지 않거나 부위가 둘이 아니면 경고를 남기고 상태를 바꾸지 않은 채 false를 반환한다.
+// TODO: 거인 전체 부위를 추가할 때 연결 관계를 따라 여러 부위를 재분배하도록 확장한다.
+bool ASwarmBossManager::RebalancePartsFromDefinition()
+{
+	if (!FormDefinition)
+	{
+		UE_LOG(LogSwarmBossManager, Warning, TEXT("FormDefinition is not assigned on %s."), *GetName());
+		return false;
+	}
+
+	if (!ValidateFormDefinition(*FormDefinition))
+	{
+		return false;
+	}
+
+	if (FormDefinition->Parts.Num() != 2)
+	{
+		UE_LOG(LogSwarmBossManager, Warning, TEXT("Rebalance currently supports exactly two parts, but %s has %d."),
+			*FormDefinition->GetName(), FormDefinition->Parts.Num());
+		return false;
+	}
+
+	const ESwarmPartId RemainderPartId = FormDefinition->RemainderPartId;
+	const FSwarmPartDefinition* RemainderPart = FormDefinition->Parts.FindByPredicate(
+		[RemainderPartId](const FSwarmPartDefinition& Part) { return Part.PartId == RemainderPartId; });
+	const FSwarmPartDefinition* OtherPart = FormDefinition->Parts.FindByPredicate(
+		[RemainderPartId](const FSwarmPartDefinition& Part) { return Part.PartId != RemainderPartId; });
+
+	return RebalanceParts(RemainderPart->PartId, OtherPart->PartId,
+		RemainderPart->AllocationWeight, OtherPart->AllocationWeight);
 }
 
 // Particles[ParticleId]에 소속 도형 기준의 TargetLocalPosition을 새 이동 목표로 저장한다.

@@ -7,16 +7,17 @@
 
 ## 1. 작업 재개 지점
 
-**거인 부위 구성 데이터의 C++ 형식은 추가했다. 다음 작은 작업은 이 데이터를 읽어 기존 몸통·왼팔을 생성하도록 Manager를 연결하는 것이다.** 거인 전체·검·변신을 한 번에 구현하지 않는다. 최근 대화에서 변신 구조를 먼저 검토한 이유는 이 데이터 구조를 나중에 크게 바꾸지 않기 위해서다.
+**Manager는 `USwarmFormDefinition` Data Asset(`/Game/Data/DA_GiantForm`)을 읽어 몸통·왼팔을 생성하고, T 재분배도 같은 데이터의 가중치를 사용한다. 다음 작은 작업은 거인 전체 부위 추가다.** 거인 전체·검·변신을 한 번에 구현하지 않는다. 최근 대화에서 변신 구조를 먼저 검토한 이유는 이 데이터 구조를 나중에 크게 바꾸지 않기 위해서다.
 
 읽을 순서:
 
 1. 이 문서의 현재 구현과 향후 형태 관리 설계.
 2. `Source/SwarmBoss/Swarm/SwarmParticleStore.h`: 구체 상태와 ID.
-3. `Source/SwarmBoss/Boss/SwarmBossManager.h`: 소유 데이터와 공개 기능.
-4. 같은 `.cpp`의 `GenerateInitialParts`, `RemoveInstance`, `TransferParticle`, `RebalanceParts`, `UpdateParticleMovement`.
-5. `Source/SwarmBoss/SwarmBossPlayerController.cpp`: 실제 클릭/T 입력.
-6. `Source/SwarmBoss/Swarm/SwarmShapeSamplerTests.cpp`: 기존 동작의 검증 조건.
+3. `Source/SwarmBoss/Boss/SwarmFormDefinition.h`: 부위 구성 데이터 형식.
+4. `Source/SwarmBoss/Boss/SwarmBossManager.h`: 소유 데이터와 공개 기능.
+5. 같은 `.cpp`의 `GenerateInitialParts`, `ValidateFormDefinition`, `RemoveInstance`, `TransferParticle`, `RebalanceParts`, `RebalancePartsFromDefinition`, `UpdateParticleMovement`.
+6. `Source/SwarmBoss/SwarmBossPlayerController.cpp`: 실제 클릭/T 입력.
+7. `Source/SwarmBoss/Swarm/SwarmShapeSamplerTests.cpp`: 기존 동작의 검증 조건.
 
 Preview는 표시 실험용으로 정리되어 있다. 게임플레이를 Preview에 다시 넣거나 삭제한 `USwarmRuntimeComponent`를 복원하지 않는다.
 
@@ -31,9 +32,11 @@ Preview는 표시 실험용으로 정리되어 있다. 게임플레이를 Previe
 
 ### 로컬 작업 트리 주의
 
-2026-11-14 확인 시 Runtime 삭제, Manager 신규 파일, Store/Preview/Sampler/테스트/Controller 수정이 미커밋 상태다. 다음 작업자는 `git status --short`부터 다시 확인한다. 새 환경으로 이동한다면 문서만이 아니라 이 소스 변경도 전달해야 같은 상태에서 이어갈 수 있다.
+Runtime→Manager 통합은 `e5a54f0`, 부위 구성 데이터 형식은 `b5f2cbb`로 커밋했다. 다음 작업자는 `git status --short`부터 다시 확인한다.
 
-`Config/DefaultEngine.ini`와 FirstPerson 외부 Actor 에셋에도 별도 수정이 있다. 이번 문서 작업에서 변경하지 않았다. 로컬 인증 토큰이 커밋에 섞이지 않도록 설정 변경을 검토하되 값은 문서·로그에 복사하지 않는다. 에셋은 사용자의 에디터 변경을 임의로 삭제하지 않는다.
+`Config/DefaultEngine.ini`와 FirstPerson 외부 Actor 에셋에는 커밋하지 않은 별도 수정이 있다. 설정 변경은 로컬 인증 토큰이므로 커밋하지 않으며 값은 문서·로그에 복사하지 않는다. 에셋은 사용자의 에디터 변경을 임의로 삭제하지 않는다.
+
+레벨에 배치한 `SwarmBossManager` 외부 Actor 파일은 `.gitignore` 허용 목록에 없어 Git이 추적하지 않는다. 새로 받은 저장소에서는 Manager를 배치하고 `Form Definition`에 `DA_GiantForm`을 지정해야 한다.
 
 ## 2. 크기와 배치 밀도
 
@@ -67,6 +70,7 @@ d = 2 × ParticleRadius + SpacingMargin
 
 ```text
 ASwarmBossManager
+ ├─ FormDefinition: USwarmFormDefinition Data Asset 참조(DA_GiantForm)
  ├─ FSwarmParticleStore
  │   ├─ Particles: 중앙 구체 배열, 슬롯 인덱스가 ParticleId
  │   └─ ActiveParticleCount: 전체 생존 수
@@ -82,13 +86,17 @@ ASwarmBossManager
 
 ### 생성
 
-`BeginPlay → GenerateInitialParts → GenerateTargets(각 부위) → InitializeParticles → ResetParticles → AddPartParticles → Store.AddParticles`.
+`BeginPlay → GenerateInitialParts → ValidateFormDefinition → AllocatePartCounts → GenerateTargets(각 부위) → InitializeParticles → ResetParticles → AddPartParticles → Store.AddParticles`.
 
-- `InitialParticleCount` 기본 90, 에디터 범위 0~10000. 왼팔은 전체/3을 버림하고 나머지를 몸통에 준다.
-- 몸통 Box 비율 (1, 0.75, 1.5), 왼팔 (0.45, 0.45, 1). 현재 코드에 직접 정의되어 있다.
-- 두 샘플링 결과가 성공한 뒤 중앙 저장소를 한 번 초기화하고 각 부위를 추가한다. `AddParticles`는 첫 중앙 ID를 반환하므로 두 번째 부위가 첫 번째를 덮어쓰지 않는다.
+- Manager Details `Swarm|Generation`의 `Form Definition`에 지정한 Data Asset을 읽는다. 비어 있으면 `FormDefinition is not assigned` 경고를 남기고 생성하지 않는다. 코드 기본값으로 대체 생성하지 않는다.
+- `InitialParticleCount` 기본 90, 에디터 범위 0~10000. 각 부위는 `전체 × AllocationWeight / 가중치 합`을 버림한 수를 받고, 버림 나머지는 `RemainderPartId`(몸통)가 받는다.
+- 부위의 도형·Box 비율은 데이터의 `Shape`, `BoxHalfExtentsRatio`를 쓴다. `DA_GiantForm`의 비율은 몸통 (1, 0.75, 1.5), 왼팔 (0.45, 0.45, 1)이다. 가중치는 이전 코드 상수 2:1로 시작했고 2026-11-14 현재 시험 중인 몸통:왼팔 10:1로 저장되어 있다. 확정값이 아니다.
+- 생성 전에 `ValidateFormDefinition`이 ID 중복·None/Preview, Manager ISM이 없는 부위·정의 누락, 음수 가중치·가중치 합 0, 비율·자세 값, 자기 부모·미정의 부모, 몸통 외 최상위 부위, 순환, 잔여 수신 부위를 검사한다. 실패 시 원인을 경고로 남기고 기존 구체를 유지한다. Clamp 메타데이터는 런타임 검증으로 간주하지 않는다.
+- Manager는 아직 몸통·왼팔 ISM만 만들므로 데이터에는 이 두 부위가 정확히 있어야 한다. 부위가 늘어나면 ISM 생성도 데이터 기반으로 바꿔야 한다.
+- 모든 부위의 샘플링 결과가 성공한 뒤 중앙 저장소를 한 번 초기화하고 각 부위를 추가한다. `AddParticles`는 첫 중앙 ID를 반환하므로 두 번째 부위가 첫 번째를 덮어쓰지 않는다.
 - 실제 `AddInstances` 반환 인덱스로 양방향 연결을 채운다. 중앙 ID와 ISM 인덱스가 같다고 가정하지 않는다.
 - `PartGap` 기본 150cm. 초기 도형의 Y 반크기와 구체 반지름으로 표면 사이 여유를 확보하고 왼팔 위치를 정한다. 재분배마다 부위 중심을 재배치하지는 않는다.
+- 데이터의 `RelativeLocation`·`RelativeRotation`은 유효성만 검사하고 아직 적용하지 않는다. 고정 cm 위치는 축소 후 관절 간격이 벌어지거나 겹칠 수 있어, 연결 위치 계산 방식을 거인 전체 부위 추가 때 함께 정한다(2026-11-14 결정).
 - 생성 때만 초기 개수 설정을 사용한다. 이후 전체 생존 수의 기준은 Store다.
 
 ### 피격과 삭제
@@ -110,9 +118,11 @@ ASwarmBossManager
 
 ### T 키 재분배
 
-`T → RebalanceSwarmPartsForTest → 각 Manager.RebalanceParts(Torso, LeftArm, 2, 1)`.
+`T → RebalanceSwarmPartsForTest → 각 Manager.RebalancePartsFromDefinition → RebalanceParts(RemainderPart, OtherPart, 가중치, 가중치)`.
 
-1. 두 부위의 현재 생존 수 합계로 목표 개수를 계산한다. 두 번째 부위는 버림, 첫 번째는 나머지를 받는다.
+`RebalancePartsFromDefinition`은 T 입력 시점의 `FormDefinition`을 다시 검증하고 부위 가중치만 읽는다. 잔여 수신 부위를 첫 번째 부위로 넘기므로 초기 생성과 같은 배분 규칙을 따른다. 도형 종류·비율은 마지막 초기 생성 때 보관한 설정을 사용한다. 데이터가 없거나 유효하지 않거나 부위가 둘이 아니면 경고 후 상태를 바꾸지 않는다. 가중치 0인 부위는 구체를 모두 다른 부위로 보낸다.
+
+1. 두 부위의 현재 생존 수 합계로 목표 개수를 계산한다. 두 번째 부위는 버림, 첫 번째는 나머지를 받는다. 가중치는 0 이상, 합은 양수여야 한다.
 2. 이미 목표 개수와 같으면 성공 반환하며 샘플링·이동 재시작을 하지 않는다. 비율이 맞으면 결손이 있어도 새 배치를 만들지 않는 현재 제한이 있다.
 3. 양쪽 새 목표를 먼저 생성한다. 생성 실패까지는 기존 상태를 유지한다.
 4. 초과 부위에서 부족 부위로 필요한 수를 보낸다. 방향과 개수는 고정되어 있지 않다.
@@ -176,11 +186,18 @@ ASwarmBossManager                         기존, 계속 중앙 소유
 - `Source/SwarmBoss/Boss/SwarmFormDefinition.h`: `FSwarmPartDefinition`과 `USwarmFormDefinition` 선언. 별도 실행 함수나 Tick은 없다.
 - 부위별 필드: `PartId`, `ParentPartId`, `Shape`, `BoxHalfExtentsRatio`, `AllocationWeight`, `RelativeLocation`, `RelativeRotation`. 위치·회전은 부모 중심 기준이며 부모 없음은 Manager 기준이다. Scale은 없다.
 - 형태 데이터는 `Parts` 목록과 잔여 수신 부위 `RemainderPartId`(몸통)를 보관한다. 실제 구체 수·샘플러 설정 전체·ISM은 넣지 않는다.
-- 이번에는 데이터 형식만 추가했다. Data Asset 인스턴스와 거인 전체의 비율·배치 수치는 아직 작성하지 않았고 Manager도 이 데이터를 읽지 않는다. 기존 몸통·왼팔 실행은 그대로다.
-- 소비 경로 연결 시 ID 유일성, 유효한 부위/부모, 몸통 루트, 순환 연결, 가중치 합, 좌표/비율 유효성을 검증해야 한다. 에디터 Clamp 메타데이터를 런타임 검증으로 간주하지 않는다.
 - 부모 상대 위치는 고정 cm 정의다. 축소 후 관절 연결 위치 자동 계산·정규화 앵커는 후속 작업이며 현재 데이터만으로 해결됐다고 간주하지 않는다.
 - 검 그룹/중복 부위 식별, 형태 상태, 행동 컴포넌트, 관절 검색은 이번 범위에서 제외했다.
-- 검증: UE Editor 타깃 빌드와 UHT 성공, 기존 자동 테스트 10개 성공/실패0(`Saved/Automation/GiantDefinition/index.json`). VS 프로젝트 파일 재생성 성공. 새 Data Asset 편집 화면과 Editor Play는 이번 작업에서 직접 확인하지 않았다. 데이터 소비 시 유효성 검사는 다음 단계다.
+- 검증: UE Editor 타깃 빌드와 UHT 성공, 기존 자동 테스트 10개 성공/실패0(`Saved/Automation/GiantDefinition/index.json`).
+
+### Manager의 형태 데이터 연결 — 2026-11-14
+
+- 값을 둘 곳으로 Data Asset과 C++ 기본값을 비교했다. 거인/검 형태를 데이터 하나씩 갈아 끼우는 변신 구조와 빌드 없는 값 수정을 위해 Data Asset을 선택했다. 값이 diff로 보이지 않고 에셋을 Git 허용 목록에 추가해야 하는 비용이 있다.
+- 사용자가 에디터에서 `/Game/Data/DA_GiantForm`(`Content/Data/DA_GiantForm.uasset`)을 만들고 Manager에 지정했다. 처음에는 이전 코드 상수와 같은 값(몸통 루트·(1, 0.75, 1.5)·가중치 2, 왼팔 부모 몸통·(0.45, 0.45, 1)·가중치 1)으로 만들었다. 이후 사용자가 가중치를 몸통:왼팔 10:1로 바꿔 시험했으며 이 값으로 커밋했다. 가중치는 아직 확정하지 않은 튜닝값이다.
+- `GenerateInitialParts`와 T 재분배가 이 데이터를 읽는다. 세부 흐름·검증 규칙은 3장 생성과 T 키 재분배에 있다.
+- 에셋이 비어 있으면 생성 실패로 처리한다. 코드 기본값 대체 경로를 두면 같은 값이 두 곳에 남는다.
+- 자동 테스트는 에셋 대신 `NewObject`로 같은 값의 데이터를 만들어 사용한다. 실제 에셋 값은 사용자 Play로 확인했다.
+- 순환 연결 검사는 구현했지만 현재 두 부위로는 다른 검사보다 먼저 걸리는 순환을 만들 수 없어 자동 테스트가 없다. 부위 추가 시 테스트를 추가한다.
 
 ### 상태와 공통 기능
 
@@ -214,19 +231,23 @@ Manager 공통 기능: 생존 수 관리, 배분, 샘플러 호출, 목표 배�
 
 ## 7. 다음 구현 순서
 
-1. 부위 구성 데이터 설계 → 기존 몸통·왼팔을 그 데이터로 생성. 현재 클릭·전달·재분배 동작 유지.
-2. 거인 전체 부위 추가. 비율·잔여·0개 부위·연결 관계 확인.
+1. ~~부위 구성 데이터 설계 → 기존 몸통·왼팔을 그 데이터로 생성. 현재 클릭·전달·재분배 동작 유지.~~ 완료(2026-11-14).
+2. 거인 전체 부위 추가. 부위 ISM을 데이터 기반으로 생성, 부모 상대 연결 위치 계산 방식 결정, 비율·잔여·0개 부위·연결 관계 확인.
 3. 거인 부위/그룹 이동·회전과 행동. 구체 고정 크기와 상대 좌표 유지 확인.
 4. 현재 두 부위 재분배를 전체 연결 관계로 확장. 관절 공간 검색 도입은 필요성을 따로 판단.
 5. 고정 N자루 복합 검 구성과 행동.
 6. 계획 준비 → 무적 전환 → 직접 이동 → 도착 완료의 변신 흐름 연결.
 7. 극소수/실패 처리, 전수 검사 실행 분리, 성능 측정과 데모 마무리.
 
-이 목록 전체를 다음 한 번의 변경으로 구현하지 않는다. 부위 데이터 형식은 추가했으며 바로 다음 작업은 기존 몸통·왼팔 생성의 데이터 연결이다.
+이 목록 전체를 다음 한 번의 변경으로 구현하지 않는다. 몸통·왼팔 생성과 T 재분배의 데이터 연결은 끝났으며 바로 다음 작업은 거인 전체 부위 추가다.
 
 ## 8. 검증과 작업 명령
 
-이번 문서 갱신에서는 소스와 기존 보고서를 확인했으며 빌드·자동 테스트·Editor Play를 새로 실행하지 않았다. 기존 EditableDuration 보고서의 `reportCreatedOn`은 `2026.11.13-13.26.18`(보고서 표기 그대로), 성공10/실패0이다. 이전 작업에서 Editor 타깃 빌드 성공을 보고했으며 실행 로그와 JSON은 로컬 Saved에 있고 Git에는 포함되지 않는다.
+형태 데이터 생성 연결: Editor 타깃 빌드 성공, 자동 테스트 11개 성공/실패0(`Saved/Automation/FormDefinitionLink/index.json`). 사용자가 `DA_GiantForm`을 지정한 Editor Play에서 생성·제거·재분배가 이전과 같이 동작함을 확인했다.
+
+T 재분배의 데이터 가중치 사용: Editor 타깃 빌드 성공, 자동 테스트 11개 성공/실패0(`Saved/Automation/DefinitionRebalance/index.json`, `reportCreatedOn` `2026.11.13-17.18.36` 보고서 표기 그대로). 사용자가 에셋 가중치를 10:1로 바꾼 Editor Play에서 생성과 T 재분배가 그 비율을 따르는 것을 확인했다.
+
+실행 로그와 JSON은 로컬 Saved에 있고 Git에는 포함되지 않는다.
 
 | 테스트 | 확인 범위 |
 |---|---|
@@ -238,8 +259,9 @@ Manager 공통 기능: 생존 수 관리, 배분, 샘플러 호출, 목표 배�
 | Stage2.TwoPartRemoval | 두 ISM의 동일 번호 구분과 제거 |
 | Stage2.PartTransfer | 소속 이전·위치/목표 유지·대응표 |
 | Stage2.TransferBatch | 여러 개 전달과 실패 입력 |
-| Stage2.RebalanceParts | 양방향 전달·정수 잔여·반복 요청 |
+| Stage2.RebalanceParts | 양방향 전달·정수 잔여·반복 요청·가중치 입력 거부 |
 | Stage2.TimedReconstruction | 설정 시간·감속·재배정·잘못된 시간 |
+| Stage2.FormDefinition | 데이터 누락, 가중치 배분과 잔여, 가중치 0, 잘못된 데이터 12종 거부, 데이터 가중치 재분배·변경 반영 |
 
 사용자는 Play에서 이동 중 피격 제거, 부위 전달, 양방향 재분배와 축소를 확인했고 0.8초 이동을 선택했다. 이는 성능 비교나 미구현 거인/검/변신 검증이 아니다. NullRHI 자동 테스트는 실제 화면·패키징 검증을 대신하지 않는다.
 

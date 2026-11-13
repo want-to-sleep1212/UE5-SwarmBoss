@@ -7,6 +7,7 @@
 
 class UInstancedStaticMeshComponent;
 class UPrimitiveComponent;
+class USwarmFormDefinition;
 
 // 초기 생성할 부위와 해당 ISM 컴포넌트 기준의 구체 중심 좌표 목록.
 struct FSwarmPartPlacement
@@ -40,6 +41,10 @@ public:
 	ASwarmBossManager();
 
 	bool GenerateInitialParts();
+
+	// 초기 생성에 사용할 형태 데이터를 바꾼다. 이미 생성된 구체는 그대로 두고 다음 GenerateInitialParts()부터 적용한다.
+	void SetFormDefinition(USwarmFormDefinition* NewFormDefinition);
+
 	bool RemoveInstance(const UPrimitiveComponent* HitComponent, int32 InstanceIndex);
 	bool TransferParticle(int32 ParticleId, ESwarmPartId DestinationPartId);
 
@@ -47,6 +52,9 @@ public:
 		TConstArrayView<FVector> TargetLocalPositions);
 
 	bool RebalanceParts(ESwarmPartId FirstPartId, ESwarmPartId SecondPartId, int32 FirstWeight, int32 SecondWeight);
+
+	// 현재 FormDefinition의 AllocationWeight로 두 부위의 생존 구체를 재분배한다. 나머지는 RemainderPartId 부위가 받는다.
+	bool RebalancePartsFromDefinition();
 
 	bool AssignParticleTarget(int32 ParticleId, const FVector& TargetLocalPosition, float MoveDuration = 0.0f);
 	bool AssignReconstructionTargets(const TArray<FVector>& Targets);
@@ -73,10 +81,17 @@ private:
 	void AddPartParticles(const FSwarmPartPlacement& Placement, double ParticleRadius);
 	void ResetParticles(int32 ExpectedParticleCount);
 
+	bool ValidateFormDefinition(const USwarmFormDefinition& Definition) const;
+
 	FSwarmPart* FindPartByComponent(const UPrimitiveComponent* HitComponent);
 	bool UpdateParticleMovement(float DeltaTime);
 
-	// Play 시작 시 생성할 전체 구체 수. 몸통:왼팔을 2:1로 나누고 정수 배분의 나머지는 몸통에 배정한다.
+	// 초기 생성할 부위의 도형·종횡비·배분 가중치를 담은 형태 데이터. 비어 있으면 생성하지 않는다.
+	// 현재 Manager는 몸통과 왼팔 ISM만 가지므로 이 두 부위를 정확히 정의한 데이터만 사용할 수 있다.
+	UPROPERTY(EditAnywhere, Category="Swarm|Generation")
+	TObjectPtr<USwarmFormDefinition> FormDefinition;
+
+	// Play 시작 시 생성할 전체 구체 수. FormDefinition의 가중치 비율로 나누고 정수 배분의 나머지는 잔여 수신 부위에 배정한다.
 	UPROPERTY(EditAnywhere, Category="Swarm|Generation", meta=(ClampMin="0", ClampMax="10000"))
 	int32 InitialParticleCount = 90;
 

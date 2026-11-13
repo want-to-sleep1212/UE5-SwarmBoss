@@ -162,8 +162,8 @@ void ASwarmBossPlayerController::TraceSwarmParticle()
 	}
 }
 
-// T 키로 각 Manager의 몸통·왼팔을 현재 생존 수 기준 2:1로 재분배하도록 요청한다.
-// 초과 부위에서 부족 부위로 필요한 만큼 전달하고 목표를 배정하는 결정은 Manager가 담당한다.
+// T 키로 각 Manager에 형태 데이터의 부위 가중치에 맞춘 현재 생존 수 재분배를 요청한다.
+// 가중치를 읽고, 초과 부위에서 부족 부위로 필요한 만큼 전달하고 목표를 배정하는 결정은 Manager가 담당한다.
 void ASwarmBossPlayerController::RebalanceSwarmPartsForTest()
 {
 	UWorld* World = GetWorld();
@@ -175,7 +175,7 @@ void ASwarmBossPlayerController::RebalanceSwarmPartsForTest()
 
 	for (TActorIterator<ASwarmBossManager> Boss(World); Boss; ++Boss)
 	{
-		if (!Boss->RebalanceParts(ESwarmPartId::Torso, ESwarmPartId::LeftArm, 2, 1))
+		if (!Boss->RebalancePartsFromDefinition())
 		{
 			UE_LOG(LogSwarmBoss, Warning, TEXT("Rebalance failed for %s."), *Boss->GetName());
 		}
