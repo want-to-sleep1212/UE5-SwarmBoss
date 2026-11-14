@@ -34,12 +34,23 @@ struct SWARMBOSS_API FSwarmPartDefinition
 	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category="Distribution", meta=(ClampMin="0"))
 	int32 AllocationWeight = 1;
 
-	// 부모 도형 중심 기준의 초기 중심 위치(cm). ParentPartId가 None이면 Manager 기준 위치이다.
-	// 크기 변화에 따른 연결부 자동 배치는 아직 없으므로 이 값만으로 손실 후 관절 연결을 보장하지 않는다.
-	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category="Pose", meta=(Units="cm"))
-	FVector RelativeLocation = FVector::ZeroVector;
+	// 부모 도형 경계에서 이 부위가 붙을 연결점. 각 축은 부모의 현재 반크기에 대한 비율(-1~1)이다.
+	// 예: (0, -1, 0.8)은 부모 왼쪽(Y-) 면의 위쪽. 구형 부모는 구 밖으로 나가는 점을 구 표면으로 당긴다.
+	// 도형이 생존 수에 따라 줄어도 비율로 계산하므로 연결점이 표면을 따라간다. 최상위 부위는 사용하지 않는다.
+	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category="Pose", meta=(ClampMin="-1", ClampMax="1"))
+	FVector ParentAnchor = FVector::ZeroVector;
 
-	// 부모 도형 기준의 초기 회전. 최상위 부위는 Manager 기준이다.
+	// 이 부위 경계에서 ParentAnchor에 맞출 점. 각 축은 이 부위의 현재 반크기에 대한 비율(-1~1)이며 RelativeRotation 적용 전 기준이다.
+	// 예: 왼팔은 (0, 1, 0.8)로 오른쪽 면 위쪽을 몸통에 맞춘다. 최상위 부위는 사용하지 않는다.
+	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category="Pose", meta=(ClampMin="-1", ClampMax="1"))
+	FVector ChildAnchor = FVector::ZeroVector;
+
+	// 관절에서 마주 보는 두 부위의 바깥쪽 구체 표면 사이 거리(cm). 0이면 구체끼리 맞닿는다.
+	// 부모 연결점이 놓인 면의 바깥 방향으로 띄우며, 구체가 경계 밖으로 튀어나오는 반지름은 Manager가 더한다.
+	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category="Pose", meta=(ClampMin="0", Units="cm"))
+	float Gap = 0.0f;
+
+	// 부모 도형 기준의 회전. 최상위 부위는 Manager 기준이다.
 	// 구체 크기가 함께 바뀌지 않도록 이 정의에는 Scale을 두지 않는다.
 	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category="Pose")
 	FRotator RelativeRotation = FRotator::ZeroRotator;

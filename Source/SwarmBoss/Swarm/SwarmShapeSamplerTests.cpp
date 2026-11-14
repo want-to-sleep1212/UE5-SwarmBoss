@@ -20,8 +20,12 @@
 
 namespace
 {
-	// 기존 코드 기본값과 같은 몸통:왼팔 2:1 형태 데이터를 임시 패키지에 만든다.
+	// 테스트용 2부위 데이터에서 몸통 왼쪽 면과 왼팔 오른쪽 면 사이의 구체 표면 간격(cm). 이전 PartGap 기본값과 같다.
+	constexpr float TwoPartArmGap = 150.0f;
+
+	// 이전 코드 기본값과 같은 몸통:왼팔 2:1 형태 데이터를 임시 패키지에 만든다.
 	// 몸통은 최상위 부위이며 박스 비율 (1, 0.75, 1.5), 왼팔은 몸통의 자식이며 (0.45, 0.45, 1)이다.
+	// 왼팔은 몸통 왼쪽 면 중앙에 오른쪽 면 중앙을 맞추고 TwoPartArmGap만큼 띄운다.
 	USwarmFormDefinition* CreateTwoPartDefinition()
 	{
 		USwarmFormDefinition* Definition = NewObject<USwarmFormDefinition>(GetTransientPackage());
@@ -39,8 +43,23 @@ namespace
 		LeftArm.Shape = ESwarmPrimitive::Box;
 		LeftArm.BoxHalfExtentsRatio = FVector(0.45, 0.45, 1.0);
 		LeftArm.AllocationWeight = 1;
+		LeftArm.ParentAnchor = FVector(0.0, -1.0, 0.0);
+		LeftArm.ChildAnchor = FVector(0.0, 1.0, 0.0);
+		LeftArm.Gap = TwoPartArmGap;
 
 		return Definition;
+	}
+
+	// Manager가 Part 정의와 Count개 구체로 초기 생성·재분배할 때 사용하는 것과 같은 샘플러 설정으로 도형 반크기를 계산한다.
+	// 샘플러는 같은 설정·시드에서 같은 결과를 내므로 테스트의 기대 위치 계산에 사용한다.
+	FVector ExpectedHalfExtents(const FSwarmPartDefinition& Part, int32 Count)
+	{
+		FSwarmSamplingSettings Settings;
+		Settings.Shape = Part.Shape;
+		Settings.BoxHalfExtents = Part.BoxHalfExtentsRatio;
+		Settings.ParticleCount = Count;
+
+		return FSwarmShapeSampler::GenerateTargets(Settings).HalfExtents;
 	}
 
 	// World에 Manager를 생성하고 몸통:왼팔 2:1 형태 데이터를 지정한다. 구체는 아직 생성하지 않는다.
@@ -467,7 +486,8 @@ bool FSwarmManagerBehaviorTest::RunTest(const FString& Parameters)
 		FCollisionObjectQueryParams ObjectQuery;
 		ObjectQuery.AddObjectTypesToQuery(ECC_GameTraceChannel3);
 
-		const FVector Center = Boss->GetActorLocation();
+		// 몸통은 바닥 맞춤으로 Manager 위로 올라가 있으므로 몸통 ISM 중심을 지나도록 쏜다.
+		const FVector Center = Instances->GetComponentLocation();
 		FHitResult Hit;
 		const bool bHit = World->LineTraceSingleByObjectType(
 			Hit,
@@ -532,7 +552,7 @@ bool FSwarmManagerBehaviorTest::RunTest(const FString& Parameters)
 						ArmMaxY = FMath::Max(ArmMaxY, CenterY + 10.0);
 					}
 				}
-				TestTrue(TEXT("Generated sizes preserve configured surface gap"), TorsoMinY - ArmMaxY >= Boss->PartGap - 1.e-4);
+				TestTrue(TEXT("Generated sizes preserve configured surface gap"), TorsoMinY - ArmMaxY >= TwoPartArmGap - 1.e-4);
 			}
 		}
 
@@ -1240,8 +1260,14 @@ bool FSwarmFormDefinitionTest::RunTest(const FString& Parameters)
 			[](USwarmFormDefinition& D) { D.Parts[0].AllocationWeight = 0; D.Parts[1].AllocationWeight = 0; }},
 		{TEXT("Non-positive box ratio"), TEXT("box ratio must be finite and positive"),
 			[](USwarmFormDefinition& D) { D.Parts[1].BoxHalfExtentsRatio = FVector(0.45, 0.0, 1.0); }},
-		{TEXT("Non-finite pose"), TEXT("relative pose must be finite"),
-			[](USwarmFormDefinition& D) { D.Parts[1].RelativeLocation.X = std::numeric_limits<double>::quiet_NaN(); }},
+		{TEXT("Non-finite anchor"), TEXT("anchors must be finite and within -1 to 1"),
+			[](USwarmFormDefinition& D) { D.Parts[1].ParentAnchor.X = std::numeric_limits<double>::quiet_NaN(); }},
+		{TEXT("Anchor outside shape"), TEXT("anchors must be finite and within -1 to 1"),
+			[](USwarmFormDefinition& D) { D.Parts[1].ChildAnchor = FVector(0.0, 1.5, 0.0); }},
+		{TEXT("Negative gap"), TEXT("gap must be finite and non-negative"),
+			[](USwarmFormDefinition& D) { D.Parts[1].Gap = -1.0f; }},
+		{TEXT("Non-finite rotation"), TEXT("relative rotation must be finite"),
+			[](USwarmFormDefinition& D) { D.Parts[1].RelativeRotation.Yaw = std::numeric_limits<double>::quiet_NaN(); }},
 		{TEXT("Self parent"), TEXT("cannot be its own parent"),
 			[](USwarmFormDefinition& D) { D.Parts[1].ParentPartId = ESwarmPartId::LeftArm; }},
 		{TEXT("Undefined parent"), TEXT("refers to an undefined parent"),
@@ -1286,7 +1312,8 @@ bool FSwarmFormDefinitionTest::RunTest(const FString& Parameters)
 		if (TestNotNull(TEXT("Head ISM is created from data"), Head))
 		{
 			TestEqual(TEXT("Head ISM holds its share"), Head->GetInstanceCount(), 22);
-			TestTrue(TEXT("Head ISM is attached to the manager root"), Head->GetAttachParent() == Boss->GetRootComponent());
+			TestTrue(TEXT("Head ISM is attached to its parent torso ISM"),
+				Head->GetAttachParent() == Boss->GetPartInstances(ESwarmPartId::Torso));
 			TestTrue(TEXT("Head ISM is registered"), Head->IsRegistered());
 		}
 
@@ -1295,16 +1322,32 @@ bool FSwarmFormDefinitionTest::RunTest(const FString& Parameters)
 		TestEqual(TEXT("Three part arm"), CountActivePartParticles(*Boss, ESwarmPartId::LeftArm), 22);
 		TestEqual(TEXT("Three part head"), CountActivePartParticles(*Boss, ESwarmPartId::Head), 22);
 
-		// 현재 재분배는 두 부위만 지원하므로 세 부위 데이터에서는 상태를 바꾸지 않고 거절해야 한다.
-		AddExpectedError(TEXT("supports exactly two parts"), EAutomationExpectedErrorFlags::Contains, 1);
-		TestFalse(TEXT("Three part rebalance is rejected"), Boss->RebalancePartsFromDefinition());
+		// 세 부위 모두 데이터 가중치로 재분배한다. 머리 6개를 제거하면 46/22/16(합 84)이고 2:1:1 목표는 42/21/21이다.
+		// 목록 순서대로 몸통의 초과 4개와 왼팔의 초과 1개가 부족한 머리로 직접 이동해야 한다.
+		for (int32 Index = 0; Index < 6; ++Index)
+		{
+			TestTrue(TEXT("Remove head particle"), Boss->RemoveInstance(Head, 0));
+		}
+
+		if (TestTrue(TEXT("Three part rebalance succeeds"), Boss->RebalancePartsFromDefinition()))
+		{
+			TestEqual(TEXT("Three part rebalance torso"), CountActivePartParticles(*Boss, ESwarmPartId::Torso), 42);
+			TestEqual(TEXT("Three part rebalance arm"), CountActivePartParticles(*Boss, ESwarmPartId::LeftArm), 21);
+			TestEqual(TEXT("Three part rebalance head"), CountActivePartParticles(*Boss, ESwarmPartId::Head), 21);
+			TestTrue(TEXT("Head ISM matches its particles"), Head && Head->GetInstanceCount() == 21);
+			TestEqual(TEXT("Rebalance keeps survivors"), Boss->GetActiveParticleCount(), 84);
+		}
+
+		// 이미 목표 개수이면 다시 눌러도 아무것도 바꾸지 않고 성공한다.
+		TestTrue(TEXT("Balanced three part rebalance succeeds"), Boss->RebalancePartsFromDefinition());
+		TestEqual(TEXT("Balanced rebalance keeps head"), CountActivePartParticles(*Boss, ESwarmPartId::Head), 21);
 	}
 
 	// 데이터에서 머리를 빼고 다시 생성하기 전에는 생성된 부위와 목록이 다르므로 재분배를 거절한다.
 	Boss->SetFormDefinition(CreateTwoPartDefinition());
 	AddExpectedError(TEXT("differ from the generated parts"), EAutomationExpectedErrorFlags::Contains, 1);
 	TestFalse(TEXT("Stale part list rebalance is rejected"), Boss->RebalancePartsFromDefinition());
-	TestEqual(TEXT("Rejected rebalance keeps head particles"), CountActivePartParticles(*Boss, ESwarmPartId::Head), 22);
+	TestEqual(TEXT("Rejected rebalance keeps head particles"), CountActivePartParticles(*Boss, ESwarmPartId::Head), 21);
 
 	// 다시 생성하면 목록에서 빠진 머리 ISM을 제거하고 남은 두 부위만 2:1로 채운다.
 	if (TestTrue(TEXT("Two part definition regenerates"), Boss->GenerateInitialParts()))
@@ -1350,6 +1393,235 @@ bool FSwarmFormDefinitionTest::RunTest(const FString& Parameters)
 		AddExpectedError(TEXT("FormDefinition is not assigned"), EAutomationExpectedErrorFlags::Contains, 1);
 		TestFalse(TEXT("Missing definition rebalance rejected"), Boss->RebalancePartsFromDefinition());
 		TestEqual(TEXT("Missing definition preserves torso"), CountActivePartParticles(*Boss, ESwarmPartId::Torso), 84);
+	}
+
+	World->DestroyWorld(false);
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FSwarmPartPlacementTest, "SwarmBoss.Stage2.PartPlacement",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+// 연결점·Gap 규칙으로 부위 ISM을 부모 ISM 기준 위치에 놓는지, ISM 부착 계층이 데이터의 부모 관계를 따르는지,
+// 재분배로 도형 크기가 바뀌면 관절 위치를 다시 계산하면서 구체의 화면 위치를 유지하는지, 0개 부위를 점으로 다루는지 검증한다.
+bool FSwarmPartPlacementTest::RunTest(const FString& Parameters)
+{
+	UWorld* World = UWorld::CreateWorld(EWorldType::Game, false);
+
+	if (!TestNotNull(TEXT("Transient world"), World))
+	{
+		return false;
+	}
+
+	ASwarmBossManager* Boss = World->SpawnActor<ASwarmBossManager>();
+
+	if (!TestNotNull(TEXT("Manager"), Boss))
+	{
+		World->DestroyWorld(false);
+		return false;
+	}
+
+	// 몸통 2, 왼팔·머리·왼손 각 1(합 5)로 기본 90개를 나누면 36/18/18/18이다.
+	// 왼팔: 몸통 왼쪽 면 위쪽 절반 지점에 오른쪽 면을 맞추고 30cm 띄운다.
+	// 머리: 구형, 몸통 윗면 중앙에 아랫점을 맞추고 붙인다(Gap 0). Yaw 45도 회전을 준다.
+	// 왼손: 왼팔 아랫면 중앙에 윗면을 맞추고 10cm 띄운다. 왼팔의 자식이므로 왼팔 ISM에 붙어야 한다.
+	USwarmFormDefinition* Definition = CreateTwoPartDefinition();
+	FSwarmPartDefinition& ArmDefinition = Definition->Parts[1];
+	ArmDefinition.ParentAnchor = FVector(0.0, -1.0, 0.5);
+	ArmDefinition.ChildAnchor = FVector(0.0, 1.0, 0.5);
+	ArmDefinition.Gap = 30.0f;
+
+	FSwarmPartDefinition& HeadDefinition = Definition->Parts.AddDefaulted_GetRef();
+	HeadDefinition.PartId = ESwarmPartId::Head;
+	HeadDefinition.ParentPartId = ESwarmPartId::Torso;
+	HeadDefinition.Shape = ESwarmPrimitive::Sphere;
+	HeadDefinition.AllocationWeight = 1;
+	HeadDefinition.ParentAnchor = FVector(0.0, 0.0, 1.0);
+	HeadDefinition.ChildAnchor = FVector(0.0, 0.0, -1.0);
+	HeadDefinition.RelativeRotation = FRotator(0.0, 45.0, 0.0);
+
+	FSwarmPartDefinition& HandDefinition = Definition->Parts.AddDefaulted_GetRef();
+	HandDefinition.PartId = ESwarmPartId::LeftHand;
+	HandDefinition.ParentPartId = ESwarmPartId::LeftArm;
+	HandDefinition.Shape = ESwarmPrimitive::Box;
+	HandDefinition.BoxHalfExtentsRatio = FVector(0.3, 0.3, 0.3);
+	HandDefinition.AllocationWeight = 1;
+	HandDefinition.ParentAnchor = FVector(0.0, 0.0, -1.0);
+	HandDefinition.ChildAnchor = FVector(0.0, 0.0, 1.0);
+	HandDefinition.Gap = 10.0f;
+
+	// 연결점 복사본을 남겨 두고 기대 위치 계산에 사용한다. 구체 반지름은 기본 10cm이므로 관절마다 두 반지름 20cm를 더한다.
+	const FSwarmPartDefinition TorsoPart = Definition->Parts[0];
+	const FSwarmPartDefinition ArmPart = Definition->Parts[1];
+	const FSwarmPartDefinition HeadPart = Definition->Parts[2];
+	const FSwarmPartDefinition HandPart = Definition->Parts[3];
+	constexpr double TwoRadii = 20.0;
+
+	auto ExpectedArmLocation = [&](const FVector& TorsoHalf, const FVector& ArmHalf)
+	{
+		return FVector(0.0, -(TorsoHalf.Y + ArmPart.Gap + TwoRadii + ArmHalf.Y), 0.5 * TorsoHalf.Z - 0.5 * ArmHalf.Z);
+	};
+
+	auto ExpectedHandLocation = [&](const FVector& ArmHalf, const FVector& HandHalf)
+	{
+		return FVector(0.0, 0.0, -(ArmHalf.Z + HandPart.Gap + TwoRadii + HandHalf.Z));
+	};
+
+	// 바닥 맞춤: 몸통 아래면·왼팔 아래면·왼손 아래면 중 가장 낮은 경계에서 구체 반지름 10cm를 더 내려간 곳이 Manager 높이가 되도록
+	// 몸통을 올린다. 머리는 몸통 위에 있으므로 바닥 후보가 아니다. 반환값은 몸통의 상대 위치이다.
+	auto ExpectedTorsoLocation = [&](const FVector& TorsoHalf, const FVector& ArmHalf, const FVector& HandHalf)
+	{
+		const double ArmZ = ExpectedArmLocation(TorsoHalf, ArmHalf).Z;
+		const double HandZ = ArmZ + ExpectedHandLocation(ArmHalf, HandHalf).Z;
+		const double LowestZ = FMath::Min3(-TorsoHalf.Z, ArmZ - ArmHalf.Z, HandZ - HandHalf.Z) - 0.5 * TwoRadii;
+		return FVector(0.0, 0.0, -LowestZ);
+	};
+
+	// 실제 활성 구체의 가장 낮은 표면이 Manager 높이보다 아래로 내려가지 않는지 확인한다(도형 경계 안에 있으므로 같거나 위).
+	auto LowestParticleSurfaceZ = [&]()
+	{
+		double LowestZ = TNumericLimits<double>::Max();
+
+		for (const FSwarmParticle& Particle : Boss->GetParticles())
+		{
+			if (Particle.bActive)
+			{
+				const FVector World = Boss->GetPartInstances(Particle.PartId)->GetComponentTransform().TransformPosition(
+					Particle.TargetLocalPosition);
+				LowestZ = FMath::Min(LowestZ, World.Z - 0.5 * TwoRadii);
+			}
+		}
+
+		return LowestZ;
+	};
+
+	Boss->SetActorLocation(FVector(0.0, 0.0, 500.0));
+	Boss->SetFormDefinition(Definition);
+
+	if (!TestTrue(TEXT("Four part definition generates"), Boss->GenerateInitialParts()))
+	{
+		World->DestroyWorld(false);
+		return false;
+	}
+
+	UInstancedStaticMeshComponent* Torso = Boss->GetPartInstances(ESwarmPartId::Torso);
+	UInstancedStaticMeshComponent* Arm = Boss->GetPartInstances(ESwarmPartId::LeftArm);
+	UInstancedStaticMeshComponent* Head = Boss->GetPartInstances(ESwarmPartId::Head);
+	UInstancedStaticMeshComponent* Hand = Boss->GetPartInstances(ESwarmPartId::LeftHand);
+
+	if (!TestNotNull(TEXT("Torso"), Torso) || !TestNotNull(TEXT("Arm"), Arm)
+		|| !TestNotNull(TEXT("Head"), Head) || !TestNotNull(TEXT("Hand"), Hand))
+	{
+		World->DestroyWorld(false);
+		return false;
+	}
+
+	// 부착 계층: 몸통은 루트, 왼팔·머리는 몸통, 왼손은 왼팔에 붙는다.
+	TestTrue(TEXT("Torso attaches to root"), Torso->GetAttachParent() == Boss->GetRootComponent());
+	TestTrue(TEXT("Arm attaches to torso"), Arm->GetAttachParent() == Torso);
+	TestTrue(TEXT("Head attaches to torso"), Head->GetAttachParent() == Torso);
+	TestTrue(TEXT("Hand attaches to arm"), Hand->GetAttachParent() == Arm);
+
+	const FVector TorsoHalf = ExpectedHalfExtents(TorsoPart, 36);
+	const FVector ArmHalf = ExpectedHalfExtents(ArmPart, 18);
+	const FVector HeadHalf = ExpectedHalfExtents(HeadPart, 18);
+	const FVector HandHalf = ExpectedHalfExtents(HandPart, 18);
+
+	TestTrue(TEXT("Torso is lifted so the lowest part touches the manager"), Torso->GetRelativeLocation().Equals(
+		ExpectedTorsoLocation(TorsoHalf, ArmHalf, HandHalf), 1.e-3));
+	TestTrue(TEXT("No particle sinks below the manager"), LowestParticleSurfaceZ() >= Boss->GetActorLocation().Z - 1.e-3);
+	TestTrue(TEXT("Arm follows torso side anchor"),
+		Arm->GetRelativeLocation().Equals(ExpectedArmLocation(TorsoHalf, ArmHalf), 1.e-3));
+	// 구형 머리의 아랫점 (0, 0, -R)은 Yaw 회전에 영향을 받지 않는다.
+	TestTrue(TEXT("Head sits on torso top"), Head->GetRelativeLocation().Equals(
+		FVector(0.0, 0.0, TorsoHalf.Z + TwoRadii + HeadHalf.X), 1.e-3));
+	TestTrue(TEXT("Head keeps data rotation"), Head->GetRelativeRotation().Equals(HeadPart.RelativeRotation, 1.e-3));
+	TestTrue(TEXT("Hand hangs below arm"),
+		Hand->GetRelativeLocation().Equals(ExpectedHandLocation(ArmHalf, HandHalf), 1.e-3));
+
+	// 몸통 10개를 제거하면 26/18이고, 2:1 재분배 목표는 몸통 30·왼팔 14(44 / 3 버림)이다.
+	// 재분배 직후 왼팔이 새 크기에 맞춰 이동하고, 그 자식인 왼손도 따라 움직이지만 구체의 화면 위치는 그대로여야 한다.
+	for (int32 Index = 0; Index < 10; ++Index)
+	{
+		TestTrue(TEXT("Remove torso particle"), Boss->RemoveInstance(Torso, 0));
+	}
+
+	TMap<int32, FVector> HandWorldPositions;
+
+	for (int32 ParticleId = 0; ParticleId < Boss->GetParticles().Num(); ++ParticleId)
+	{
+		const FSwarmParticle& Particle = Boss->GetParticles()[ParticleId];
+
+		if (Particle.bActive && Particle.PartId == ESwarmPartId::LeftHand)
+		{
+			HandWorldPositions.Add(ParticleId, Hand->GetComponentTransform().TransformPosition(Particle.LocalPosition));
+		}
+	}
+
+	if (TestTrue(TEXT("Rebalance with four parts"), Boss->RebalanceParts(ESwarmPartId::Torso, ESwarmPartId::LeftArm, 2, 1)))
+	{
+		const FVector NewTorsoHalf = ExpectedHalfExtents(TorsoPart, 30);
+		const FVector NewArmHalf = ExpectedHalfExtents(ArmPart, 14);
+
+		TestTrue(TEXT("Arm joint follows new sizes"),
+			Arm->GetRelativeLocation().Equals(ExpectedArmLocation(NewTorsoHalf, NewArmHalf), 1.e-3));
+		TestTrue(TEXT("Hand joint follows new arm size"),
+			Hand->GetRelativeLocation().Equals(ExpectedHandLocation(NewArmHalf, HandHalf), 1.e-3));
+		TestTrue(TEXT("Torso height follows new sizes"), Torso->GetRelativeLocation().Equals(
+			ExpectedTorsoLocation(NewTorsoHalf, NewArmHalf, HandHalf), 1.e-3));
+		TestTrue(TEXT("No particle target sinks below the manager after rebalance"),
+			LowestParticleSurfaceZ() >= Boss->GetActorLocation().Z - 1.e-3);
+
+		bool bHandParticlesStayed = true;
+		bool bHandInstancesMatch = true;
+
+		for (const TPair<int32, FVector>& Pair : HandWorldPositions)
+		{
+			const FSwarmParticle& Particle = Boss->GetParticles()[Pair.Key];
+			const FVector WorldPosition = Hand->GetComponentTransform().TransformPosition(Particle.LocalPosition);
+			FTransform InstanceTransform;
+
+			bHandParticlesStayed &= WorldPosition.Equals(Pair.Value, 1.e-3);
+			bHandInstancesMatch &= Hand->GetInstanceTransform(Particle.InstanceIndex, InstanceTransform, /*bWorldSpace=*/true)
+				&& InstanceTransform.GetLocation().Equals(Pair.Value, 1.e-3);
+		}
+
+		TestTrue(TEXT("Hand particles keep world positions at rebalance"), bHandParticlesStayed);
+		TestTrue(TEXT("Hand instances keep world positions at rebalance"), bHandInstancesMatch);
+		TestTrue(TEXT("Moved hand starts gliding to its local targets"), Boss->IsActorTickEnabled());
+
+		// 재구성 시간이 지나면 왼손 구체는 왼손 ISM 기준 기존 목표에 도착한다.
+		for (int32 Step = 0; Step < 10; ++Step)
+		{
+			Boss->Tick(0.1f);
+		}
+
+		bool bHandArrived = true;
+
+		for (const TPair<int32, FVector>& Pair : HandWorldPositions)
+		{
+			const FSwarmParticle& Particle = Boss->GetParticles()[Pair.Key];
+			bHandArrived &= Particle.LocalPosition.Equals(Particle.TargetLocalPosition, 1.e-3);
+		}
+
+		TestTrue(TEXT("Hand particles arrive at local targets"), bHandArrived);
+		TestFalse(TEXT("Movement finishes"), Boss->IsActorTickEnabled());
+	}
+
+	// 0개 부위는 크기 0인 점으로 다룬다. 왼팔 가중치가 0이면 왼팔 중심이 몸통 왼쪽 면에서 (Gap + 두 반지름)만큼 떨어진다.
+	USwarmFormDefinition* ZeroArmDefinition = CreateTwoPartDefinition();
+	ZeroArmDefinition->Parts[1].AllocationWeight = 0;
+	Boss->SetFormDefinition(ZeroArmDefinition);
+
+	if (TestTrue(TEXT("Zero arm definition generates"), Boss->GenerateInitialParts()))
+	{
+		const FVector ZeroTorsoHalf = ExpectedHalfExtents(ZeroArmDefinition->Parts[0], 90);
+		TestTrue(TEXT("Removed hand ISM is released"), Boss->GetPartInstances(ESwarmPartId::LeftHand) == nullptr);
+		TestTrue(TEXT("Empty arm is placed as a point"), Boss->GetPartInstances(ESwarmPartId::LeftArm)->GetRelativeLocation().Equals(
+			FVector(0.0, -(ZeroTorsoHalf.Y + TwoPartArmGap + TwoRadii), 0.0), 1.e-3));
+		// 빈 왼팔은 바닥 계산에서 빠지므로 몸통 아래 구체 표면이 Manager 높이에 온다.
+		TestTrue(TEXT("Empty arm is ignored for grounding"), Boss->GetPartInstances(ESwarmPartId::Torso)->GetRelativeLocation().Equals(
+			FVector(0.0, 0.0, ZeroTorsoHalf.Z + 0.5 * TwoRadii), 1.e-3));
 	}
 
 	World->DestroyWorld(false);

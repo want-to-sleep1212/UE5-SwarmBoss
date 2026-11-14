@@ -1,6 +1,7 @@
 #pragma once
 
 #include "GameFramework/Actor.h"
+#include "Boss/SwarmFormDefinition.h"
 #include "Swarm/SwarmParticleStore.h"
 #include "Swarm/SwarmShapeSampler.h"
 #include "SwarmBossManager.generated.h"
@@ -30,6 +31,13 @@ struct FSwarmPart
 
 	// 마지막 초기 생성에 사용한 도형·간격 설정. 재분배 시 개수만 바꿔 목표 좌표를 생성한다.
 	FSwarmSamplingSettings SamplingSettings;
+
+	// 마지막 초기 생성에 사용한 부위 정의 복사본. 부모·연결점·Gap·회전으로 이 ISM의 위치를 계산한다.
+	// 생성 후 에셋이 바뀌어도 재분배 위치 계산이 생성 당시 구성과 어긋나지 않도록 복사해 둔다.
+	FSwarmPartDefinition Definition;
+
+	// 현재 목표 배치의 도형 반크기(cm, 구 중심 허용 영역). 구는 세 축 모두 반지름이며, 구체가 0개면 0이다.
+	FVector HalfExtents = FVector::ZeroVector;
 };
 
 /** 중앙 구체 저장소와 부위별 ISM을 소유하고, 구체 생성·제거·목표 배정·이동을 처리한다. */
@@ -54,7 +62,7 @@ public:
 
 	bool RebalanceParts(ESwarmPartId FirstPartId, ESwarmPartId SecondPartId, int32 FirstWeight, int32 SecondWeight);
 
-	// 현재 FormDefinition의 AllocationWeight로 두 부위의 생존 구체를 재분배한다. 나머지는 RemainderPartId 부위가 받는다.
+	// 현재 FormDefinition의 AllocationWeight로 모든 부위의 생존 구체를 재분배한다. 나머지는 RemainderPartId 부위가 받는다.
 	bool RebalancePartsFromDefinition();
 
 	bool AssignParticleTarget(int32 ParticleId, const FVector& TargetLocalPosition, float MoveDuration = 0.0f);
@@ -85,6 +93,8 @@ private:
 
 	bool ValidateFormDefinition(const USwarmFormDefinition& Definition) const;
 	void SyncPartInstances(const USwarmFormDefinition& Definition);
+	void ApplyPartPlacement(bool bPreserveParticleWorldPositions);
+	bool RebalanceToCounts(TConstArrayView<TPair<ESwarmPartId, int32>> PartTargetCounts);
 
 	FSwarmPart* FindPartByComponent(const UPrimitiveComponent* HitComponent);
 	bool UpdateParticleMovement(float DeltaTime);
@@ -97,10 +107,6 @@ private:
 	// Play 시작 시 생성할 전체 구체 수. FormDefinition의 가중치 비율로 나누고 정수 배분의 나머지는 잔여 수신 부위에 배정한다.
 	UPROPERTY(EditAnywhere, Category="Swarm|Generation", meta=(ClampMin="0", ClampMax="10000"))
 	int32 InitialParticleCount = 90;
-
-	// 초기 생성 시 몸통과 왼팔의 구체 표면 사이에 확보할 Y축 여유 거리(cm).
-	UPROPERTY(EditAnywhere, Category="Swarm|Generation", meta=(ClampMin="0", Units="cm"))
-	float PartGap = 150.0f;
 
 	FSwarmParticleStore ParticleStore;
 
