@@ -4,6 +4,7 @@
 #include "Components/SceneComponent.h"
 #include "Engine/StaticMesh.h"
 #include "Boss/SwarmFormDefinition.h"
+#include "Boss/SwarmTransferPlanner.h"
 #include "Swarm/SwarmShapeSampler.h"
 #include "UObject/ConstructorHelpers.h"
 
@@ -130,6 +131,13 @@ ASwarmBossManager::ASwarmBossManager()
 	{
 		SphereMesh = Sphere.Object;
 	}
+}
+
+// 부위별 샘플링 시드. 샘플러 기본 시드에 PartId마다 다른 값을 더해, 도형·비율·개수가 같은 좌우 부위도 서로 다른 배치가 나오게 한다.
+// 같은 부위는 항상 같은 시드이므로 같은 개수면 같은 배치를 재현한다(재분배 시 개수가 그대로인 부위는 움직이지 않는다).
+int32 ASwarmBossManager::GetPartSamplingSeed(ESwarmPartId PartId)
+{
+	return int32(uint32(FSwarmSamplingSettings().Seed) + uint32(PartId) * 7919u);
 }
 
 // PartId 부위의 ISM을 반환한다. 아직 생성하지 않았거나 마지막 생성 데이터에 없는 부위이면 nullptr를 반환한다.
@@ -386,6 +394,8 @@ bool ASwarmBossManager::GenerateInitialParts()
 		Settings.Shape = PartDefinition.Shape;
 		Settings.BoxHalfExtents = PartDefinition.BoxHalfExtentsRatio;
 		Settings.ParticleCount = PartCounts.FindChecked(PartDefinition.PartId);
+		Settings.PackingCoefficient = PackingCoefficient;
+		Settings.Seed = GetPartSamplingSeed(PartDefinition.PartId);
 
 		FSwarmSamplingResult Result = FSwarmShapeSampler::GenerateTargets(Settings);
 
@@ -560,7 +570,7 @@ bool ASwarmBossManager::ValidateFormDefinition(const USwarmFormDefinition& Defin
 // 중앙 Particles 배열을 앞에서부터 읽어, 활성 상태이며 소속이 PartId인 구체를 최대 MaxCount개 선택한다.
 // 반환값은 중앙 배열의 인덱스(ParticleId) 목록이다. 부족하면 있는 만큼, MaxCount가 0 이하이면 빈 배열을 반환한다.
 // 구체의 소속이나 위치는 바꾸지 않으며, 가까운 순서가 아닌 중앙 배열 순서로 선택한다.
-// TODO: 관절을 통한 부위 간 전달을 구현할 때, 부위별 공간 자료구조에서 관절 근처 구체를 검색하도록 전환한다.
+// 재분배의 부위 간 전달은 관절에 가까운 구체를 고르는 SelectParticlesNearest()를 사용한다.
 TArray<int32> ASwarmBossManager::SelectPartParticleIds(ESwarmPartId PartId, int32 MaxCount) const
 {
 	TArray<int32> SelectedParticleIds;
@@ -588,6 +598,81 @@ TArray<int32> ASwarmBossManager::SelectPartParticleIds(ESwarmPartId PartId, int3
 		{
 			break;
 		}
+	}
+
+	return SelectedParticleIds;
+}
+
+// 이웃한 두 부위 사이 관절의 월드 위치를 반환한다. 순서는 상관없으며, 둘 중 한쪽이 다른 쪽의 부모여야 한다.
+// 관절 위치는 부모 연결점과 자식 연결점(둘 다 현재 도형 크기 기준 경계 위 점)의 가운데, 즉 Gap 사이의 중간이다.
+// 이웃이 아니거나 부위가 없으면 첫 번째 부위의 ISM 위치를 반환한다.
+FVector ASwarmBossManager::GetJointWorldLocation(ESwarmPartId FirstPartId, ESwarmPartId SecondPartId) const
+{
+	const FSwarmPart* First = Parts.Find(FirstPartId);
+	const FSwarmPart* Second = Parts.Find(SecondPartId);
+
+	if (!First || !Second || !IsValid(First->Instances) || !IsValid(Second->Instances))
+	{
+		return First && IsValid(First->Instances) ? First->Instances->GetComponentLocation() : GetActorLocation();
+	}
+
+	const FSwarmPart* Child = First->Definition.ParentPartId == SecondPartId ? First
+		: Second->Definition.ParentPartId == FirstPartId ? Second : nullptr;
+
+	if (!Child)
+	{
+		return First->Instances->GetComponentLocation();
+	}
+
+	const FSwarmPart* Parent = Child == First ? Second : First;
+	const FSwarmPartDefinition& Definition = Child->Definition;
+	const FVector ParentPoint = Parent->Instances->GetComponentTransform().TransformPosition(
+		GetAnchorPoint(Parent->Definition.Shape, Definition.ParentAnchor, Parent->HalfExtents));
+	const FVector ChildPoint = Child->Instances->GetComponentTransform().TransformPosition(
+		GetAnchorPoint(Definition.Shape, Definition.ChildAnchor, Child->HalfExtents));
+
+	return 0.5 * (ParentPoint + ChildPoint);
+}
+
+// PartId 부위의 활성 구체 중 현재 월드 위치가 WorldPoint에 가까운 순서로 최대 MaxCount개를 골라 ParticleId 목록을 반환한다.
+// ExcludedParticleIds에 있는 구체는 고르지 않는다. 거리가 같으면 ParticleId가 작은 쪽을 먼저 고른다.
+// 공간 자료구조 없이 부위 구체 전체를 정렬한다. 재분배처럼 가끔 호출하는 용도이며, 매 프레임 호출하지 않는다.
+TArray<int32> ASwarmBossManager::SelectParticlesNearest(ESwarmPartId PartId, const FVector& WorldPoint, int32 MaxCount,
+	const TSet<int32>& ExcludedParticleIds) const
+{
+	TArray<int32> SelectedParticleIds;
+	const FSwarmPart* Part = Parts.Find(PartId);
+
+	if (MaxCount <= 0 || !Part || !IsValid(Part->Instances))
+	{
+		return SelectedParticleIds;
+	}
+
+	const FTransform PartTransform = Part->Instances->GetComponentTransform();
+	const TArray<FSwarmParticle>& Particles = ParticleStore.GetParticles();
+	TArray<TPair<double, int32>> Candidates;
+	Candidates.Reserve(Part->InstanceToParticle.Num());
+
+	for (int32 ParticleId : Part->InstanceToParticle)
+	{
+		if (Particles.IsValidIndex(ParticleId) && Particles[ParticleId].bActive && !ExcludedParticleIds.Contains(ParticleId))
+		{
+			const FVector WorldPosition = PartTransform.TransformPosition(Particles[ParticleId].LocalPosition);
+			Candidates.Emplace(FVector::DistSquared(WorldPosition, WorldPoint), ParticleId);
+		}
+	}
+
+	Candidates.Sort([](const TPair<double, int32>& A, const TPair<double, int32>& B)
+	{
+		return A.Key != B.Key ? A.Key < B.Key : A.Value < B.Value;
+	});
+
+	const int32 SelectedCount = FMath::Min(MaxCount, Candidates.Num());
+	SelectedParticleIds.Reserve(SelectedCount);
+
+	for (int32 Index = 0; Index < SelectedCount; ++Index)
+	{
+		SelectedParticleIds.Add(Candidates[Index].Value);
 	}
 
 	return SelectedParticleIds;
@@ -948,10 +1033,12 @@ bool ASwarmBossManager::RebalanceParts(ESwarmPartId FirstPartId, ESwarmPartId Se
 // 목표 개수 합은 목록 부위의 현재 개수 합과 같아야 하며, 부위가 중복되거나 없거나 둘 미만이면 상태를 바꾸지 않고 false를 반환한다.
 // 1) 각 부위의 초기 생성 설정에서 개수만 바꿔 새 목표 좌표를 생성한다. 하나라도 실패하면 상태를 바꾸지 않는다.
 // 2) 새 도형 크기로 모든 부위 ISM 위치를 다시 계산한다. 위치가 바뀐 부위의 구체는 화면 위치를 유지한 채 다시 이동한다.
-// 3) 목록 순서대로 초과 부위에서 부족 부위로 필요한 수를 직접 보낸다. 부위 연결 관계는 따지지 않는다.
+// 3) 부위 트리에서 관절마다 지나갈 수를 계산해 이웃 부위끼리만 보낸다(FSwarmTransferPlanner). 모든 관절의 전달은 동시에 출발한다.
+//    보낼 부위가 가진 수보다 많이 넘겨야 하면, 그 부위로 들어오는 구체 일부가 길목을 건너뛰어 다음 부위로 바로 간다.
+//    보낼 구체는 첫 관절에 가장 가까운 것부터 고른다.
 // 4) 각 부위의 생존 구체 전체에 새 목표를 순서대로 배정하고 ReconstructionDuration초 동안 이동시킨다.
 // 재구성 시간이 유효한 양수가 아니면 거부한다. 모든 부위가 이미 목표 개수이면 아무것도 바꾸지 않고 true를 반환한다.
-// 전달이 일부만 성공하면 성공한 변경은 유지하고 false를 반환한다. 관절 근처 선택은 하지 않으며 선택은 중앙 배열 순서를 사용한다.
+// 전달이 일부만 성공하면 성공한 변경은 유지하고 false를 반환한다.
 bool ASwarmBossManager::RebalanceToCounts(TConstArrayView<TPair<ESwarmPartId, int32>> PartTargetCounts)
 {
 	if (!FMath::IsFinite(ReconstructionDuration) || ReconstructionDuration <= 0.0f || PartTargetCounts.Num() < 2)
@@ -961,7 +1048,6 @@ bool ASwarmBossManager::RebalanceToCounts(TConstArrayView<TPair<ESwarmPartId, in
 
 	const int32 PartCount = PartTargetCounts.Num();
 	TArray<FSwarmPart*> TargetParts;
-	TArray<int32> Remaining;
 	TSet<ESwarmPartId> SeenPartIds;
 	int64 CountDifference = 0;
 	bool bAlreadyBalanced = true;
@@ -975,11 +1061,10 @@ bool ASwarmBossManager::RebalanceToCounts(TConstArrayView<TPair<ESwarmPartId, in
 			return false;
 		}
 
-		// Remaining은 (현재 개수 - 목표 개수)다. 양수는 보내야 할 수, 음수는 받아야 할 수다.
+		// Surplus는 (현재 개수 - 목표 개수)다. 양수는 보내야 할 수, 음수는 받아야 할 수다.
 		const int32 Surplus = Part->InstanceToParticle.Num() - Pair.Value;
 		SeenPartIds.Add(Pair.Key);
 		TargetParts.Add(Part);
-		Remaining.Add(Surplus);
 		CountDifference += Surplus;
 		bAlreadyBalanced &= Surplus == 0;
 	}
@@ -1022,39 +1107,67 @@ bool ASwarmBossManager::RebalanceToCounts(TConstArrayView<TPair<ESwarmPartId, in
 
 	ApplyPartPlacement(/*bPreserveParticleWorldPositions=*/true);
 
-	// 앞에서부터 초과 부위마다 아직 부족한 부위를 차례로 채운다. 받는 부위의 임시 목표는 새 목표 중 아직 쓰지 않은 구간을 쓴다.
-	int32 DestinationIndex = 0;
+	// 부위 트리 위에서 이웃 부위끼리만 넘기는 전달 계획을 만든다. 목록에 없는 부위는 개수를 바꾸지 않고 길목 역할만 한다.
+	TMap<ESwarmPartId, ESwarmPartId> Parents;
+	TMap<ESwarmPartId, int32> CurrentCounts;
+	TMap<ESwarmPartId, int32> TargetCounts;
 
-	for (int32 SourceIndex = 0; SourceIndex < PartCount; ++SourceIndex)
+	for (const TPair<ESwarmPartId, FSwarmPart>& Pair : Parts)
 	{
-		while (Remaining[SourceIndex] > 0)
+		Parents.Add(Pair.Key, Pair.Value.Definition.ParentPartId);
+		CurrentCounts.Add(Pair.Key, Pair.Value.InstanceToParticle.Num());
+		TargetCounts.Add(Pair.Key, Pair.Value.InstanceToParticle.Num());
+	}
+
+	for (int32 Index = 0; Index < PartCount; ++Index)
+	{
+		TargetCounts[PartTargetCounts[Index].Key] = PartTargetCounts[Index].Value;
+	}
+
+	TArray<FSwarmTransferShipment> Shipments;
+
+	if (!FSwarmTransferPlanner::Plan(Parents, CurrentCounts, TargetCounts, Shipments))
+	{
+		UE_LOG(LogSwarmBossManager, Warning, TEXT("Rebalance %s: transfer planning failed."), *GetName());
+		return false;
+	}
+
+	// 묶음마다 출발 부위에서 첫 관절에 가장 가까운 구체를 골라 최종 부위로 보낸다. 모든 묶음은 동시에 출발한다.
+	// 이번 재분배에서 이미 옮긴 구체는 다시 고르지 않으므로, 들어온 구체가 곧바로 다른 곳으로 다시 나가지 않는다.
+	// 이동 목표는 바로 아래의 최종 배정에서 다시 정하므로 여기서는 소속만 바꾼다.
+	TSet<int32> MovedParticleIds;
+
+	for (const FSwarmTransferShipment& Shipment : Shipments)
+	{
+		const ESwarmPartId SourcePartId = Shipment.Path[0];
+		const ESwarmPartId DestinationPartId = Shipment.Path.Last();
+		const FVector JointLocation = GetJointWorldLocation(SourcePartId, Shipment.Path[1]);
+		const TArray<int32> ParticleIds =
+			SelectParticlesNearest(SourcePartId, JointLocation, Shipment.Count, MovedParticleIds);
+		int32 TransferredCount = 0;
+
+		for (int32 ParticleId : ParticleIds)
 		{
-			while (DestinationIndex < PartCount && Remaining[DestinationIndex] >= 0)
+			if (TransferParticle(ParticleId, DestinationPartId))
 			{
-				++DestinationIndex;
+				MovedParticleIds.Add(ParticleId);
+				++TransferredCount;
 			}
+		}
 
-			check(DestinationIndex < PartCount);
+		FString PathText;
 
-			const int32 RequiredCount = FMath::Min(Remaining[SourceIndex], -Remaining[DestinationIndex]);
-			const int32 DestinationCurrentCount = PartTargetCounts[DestinationIndex].Value + Remaining[DestinationIndex];
-			const TConstArrayView<FVector> TransferTargets =
-				MakeArrayView(Results[DestinationIndex].Points).Slice(DestinationCurrentCount, RequiredCount);
-			const ESwarmPartId SourcePartId = PartTargetCounts[SourceIndex].Key;
-			const ESwarmPartId DestinationPartId = PartTargetCounts[DestinationIndex].Key;
-			const int32 TransferredCount = TransferParticlesToTargets(SourcePartId, DestinationPartId, TransferTargets);
+		for (ESwarmPartId PartId : Shipment.Path)
+		{
+			PathText += (PathText.IsEmpty() ? TEXT("") : TEXT(" -> ")) + UEnum::GetValueAsString(PartId);
+		}
 
-			UE_LOG(LogSwarmBossManager, Display, TEXT("Rebalance %s: %s -> %s Requested=%d Transferred=%d Total=%d"),
-				*GetName(), *UEnum::GetValueAsString(SourcePartId), *UEnum::GetValueAsString(DestinationPartId),
-				RequiredCount, TransferredCount, GetActiveParticleCount());
+		UE_LOG(LogSwarmBossManager, Display, TEXT("Rebalance %s: %s Requested=%d Transferred=%d Total=%d"),
+			*GetName(), *PathText, Shipment.Count, TransferredCount, GetActiveParticleCount());
 
-			if (TransferredCount != RequiredCount)
-			{
-				return false;
-			}
-
-			Remaining[SourceIndex] -= RequiredCount;
-			Remaining[DestinationIndex] += RequiredCount;
+		if (TransferredCount != Shipment.Count)
+		{
+			return false;
 		}
 	}
 
@@ -1084,9 +1197,8 @@ bool ASwarmBossManager::RebalanceToCounts(TConstArrayView<TPair<ESwarmPartId, in
 // T 입력 시점의 FormDefinition 가중치로 생성된 모든 부위의 생존 구체를 재분배한다.
 // 현재 생존 수 합계를 초기 생성과 같은 규칙(가중치 비율 버림, 나머지는 RemainderPartId)으로 나눈 뒤 RebalanceToCounts()로 맞춘다.
 // 가중치만 다시 읽으며, 도형 종류·종횡비는 마지막 초기 생성 때 보관한 설정을 그대로 사용한다.
-// 부위 사이 이동은 연결 관계와 상관없이 초과 부위에서 부족 부위로 직접 보낸다.
+// 부위 사이 이동은 부위 트리의 이웃끼리만 넘기며, 모든 관절의 전달이 동시에 출발한다.
 // 데이터가 없거나 유효하지 않거나, 생성된 부위와 목록이 다르면 경고를 남기고 상태를 바꾸지 않은 채 false를 반환한다.
-// TODO: 필요성이 확인되면 이웃 부위끼리만 전달하도록 연결 관계를 따르는 방식으로 교체한다.
 bool ASwarmBossManager::RebalancePartsFromDefinition()
 {
 	if (!FormDefinition)

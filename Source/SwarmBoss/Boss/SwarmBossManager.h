@@ -72,6 +72,9 @@ public:
 	const TArray<FSwarmParticle>& GetParticles() const;
 	UInstancedStaticMeshComponent* GetPartInstances(ESwarmPartId PartId) const;
 
+	// 부위 생성·재분배에 쓰는 샘플링 시드. 부위마다 달라 좌우 같은 도형도 다른 배치가 나온다.
+	static int32 GetPartSamplingSeed(ESwarmPartId PartId);
+
 	// 중앙 Particles 배열 순서대로 지정 부위의 활성 구체를 최대 MaxCount개 선택해 ParticleId 목록을 반환한다.
 	TArray<int32> SelectPartParticleIds(ESwarmPartId PartId, int32 MaxCount) const;
 
@@ -82,6 +85,7 @@ protected:
 
 private:
 	friend class FSwarmManagerBehaviorTest;
+	friend class FSwarmNeighborTransferTest;
 
 	// 재구성 목표를 배정한 시점부터 도착까지의 게임 시간(초). 변경한 값은 다음 목표 배정부터 적용한다.
 	UPROPERTY(EditAnywhere, Category="Swarm|Movement", meta=(ClampMin="0.01", UIMin="0.01", Units="s"))
@@ -96,6 +100,10 @@ private:
 	void ApplyPartPlacement(bool bPreserveParticleWorldPositions);
 	bool RebalanceToCounts(TConstArrayView<TPair<ESwarmPartId, int32>> PartTargetCounts);
 
+	FVector GetJointWorldLocation(ESwarmPartId FirstPartId, ESwarmPartId SecondPartId) const;
+	TArray<int32> SelectParticlesNearest(ESwarmPartId PartId, const FVector& WorldPoint, int32 MaxCount,
+		const TSet<int32>& ExcludedParticleIds) const;
+
 	FSwarmPart* FindPartByComponent(const UPrimitiveComponent* HitComponent);
 	bool UpdateParticleMovement(float DeltaTime);
 
@@ -107,6 +115,11 @@ private:
 	// Play 시작 시 생성할 전체 구체 수. FormDefinition의 가중치 비율로 나누고 정수 배분의 나머지는 잔여 수신 부위에 배정한다.
 	UPROPERTY(EditAnywhere, Category="Swarm|Generation", meta=(ClampMin="0", ClampMax="10000"))
 	int32 InitialParticleCount = 90;
+
+	// 부위 도형 크기를 정하는 배치 계수 k(필요 부피 = 구체 수 × 간격³ / k). 클수록 도형이 작아져 구체가 촘촘해진다.
+	// 너무 크면 샘플링이 실패하거나 도형이 확장된다. 다음 GenerateInitialParts()부터 적용하며, 재분배는 생성 때 값을 유지한다.
+	UPROPERTY(EditAnywhere, Category="Swarm|Generation", meta=(ClampMin="0.05", ClampMax="0.7"))
+	float PackingCoefficient = 0.5f;
 
 	FSwarmParticleStore ParticleStore;
 

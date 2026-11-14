@@ -13,6 +13,7 @@
 #include <limits>
 #include "Boss/SwarmBossManager.h"
 #include "Boss/SwarmFormDefinition.h"
+#include "Boss/SwarmTransferPlanner.h"
 #include "SwarmShapePreview.h"
 #include "Components/InstancedStaticMeshComponent.h"
 #include "Engine/World.h"
@@ -22,6 +23,9 @@ namespace
 {
 	// 테스트용 2부위 데이터에서 몸통 왼쪽 면과 왼팔 오른쪽 면 사이의 구체 표면 간격(cm). 이전 PartGap 기본값과 같다.
 	constexpr float TwoPartArmGap = 150.0f;
+
+	// ASwarmBossManager::PackingCoefficient 기본값. 기대 도형 크기를 Manager와 같은 설정으로 계산할 때 쓴다.
+	constexpr float ManagerPackingCoefficient = 0.5f;
 
 	// 이전 코드 기본값과 같은 몸통:왼팔 2:1 형태 데이터를 임시 패키지에 만든다.
 	// 몸통은 최상위 부위이며 박스 비율 (1, 0.75, 1.5), 왼팔은 몸통의 자식이며 (0.45, 0.45, 1)이다.
@@ -58,6 +62,8 @@ namespace
 		Settings.Shape = Part.Shape;
 		Settings.BoxHalfExtents = Part.BoxHalfExtentsRatio;
 		Settings.ParticleCount = Count;
+		Settings.PackingCoefficient = ManagerPackingCoefficient;
+		Settings.Seed = ASwarmBossManager::GetPartSamplingSeed(Part.PartId);
 
 		return FSwarmShapeSampler::GenerateTargets(Settings).HalfExtents;
 	}
@@ -1628,4 +1634,277 @@ bool FSwarmPartPlacementTest::RunTest(const FString& Parameters)
 	return true;
 }
 
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FSwarmTransferPlannerTest, "SwarmBoss.Stage2.TransferPlanner",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+// 부위 트리의 관절별 흐름 계산, 이웃 부위끼리만 넘기는 계획, 길목이 모자랄 때의 경로 연장, 잘못된 입력 거부를 검증한다.
+bool FSwarmTransferPlannerTest::RunTest(const FString& Parameters)
+{
+	// 몸통(최상위) ─ 머리, 몸통 ─ 왼팔 ─ 왼손.
+	const TMap<ESwarmPartId, ESwarmPartId> Parents =
+	{
+		{ESwarmPartId::Torso, ESwarmPartId::None},
+		{ESwarmPartId::Head, ESwarmPartId::Torso},
+		{ESwarmPartId::LeftArm, ESwarmPartId::Torso},
+		{ESwarmPartId::LeftHand, ESwarmPartId::LeftArm}
+	};
+
+	auto ExpectShipment = [this](const TArray<FSwarmTransferShipment>& Shipments, int32 Index,
+		std::initializer_list<ESwarmPartId> Path, int32 Count)
+	{
+		const FString Label = FString::Printf(TEXT("Shipment %d"), Index);
+
+		if (TestTrue(*(Label + TEXT(" exists")), Shipments.IsValidIndex(Index)))
+		{
+			TestTrue(*(Label + TEXT(" path")), Shipments[Index].Path == TArray<ESwarmPartId>(Path));
+			TestEqual(*(Label + TEXT(" count")), Shipments[Index].Count, Count);
+		}
+	};
+
+	// 머리만 부족(-6): 손 → 팔 3, 팔 → 몸통 4(팔 1 + 손 3), 몸통 → 머리 6. 모두 관절 하나만 건넌다.
+	TArray<FSwarmTransferShipment> Shipments;
+	TestTrue(TEXT("Head loss plan"), FSwarmTransferPlanner::Plan(Parents,
+		{{ESwarmPartId::Torso, 40}, {ESwarmPartId::Head, 10}, {ESwarmPartId::LeftArm, 20}, {ESwarmPartId::LeftHand, 20}},
+		{{ESwarmPartId::Torso, 38}, {ESwarmPartId::Head, 16}, {ESwarmPartId::LeftArm, 19}, {ESwarmPartId::LeftHand, 17}},
+		Shipments));
+	TestEqual(TEXT("Head loss shipment count"), Shipments.Num(), 3);
+	ExpectShipment(Shipments, 0, {ESwarmPartId::LeftHand, ESwarmPartId::LeftArm}, 3);
+	ExpectShipment(Shipments, 1, {ESwarmPartId::LeftArm, ESwarmPartId::Torso}, 4);
+	ExpectShipment(Shipments, 2, {ESwarmPartId::Torso, ESwarmPartId::Head}, 6);
+
+	// 팔이 2개만 남고 손도 부족: 몸통 → 팔 23, 팔 → 손 5. 팔은 자기 구체 2개만 보낼 수 있으므로
+	// 몸통에서 오는 23개 중 3개가 팔을 건너뛰어 손으로 바로 간다.
+	TestTrue(TEXT("Relay plan"), FSwarmTransferPlanner::Plan(Parents,
+		{{ESwarmPartId::Torso, 60}, {ESwarmPartId::Head, 18}, {ESwarmPartId::LeftArm, 2}, {ESwarmPartId::LeftHand, 10}},
+		{{ESwarmPartId::Torso, 37}, {ESwarmPartId::Head, 18}, {ESwarmPartId::LeftArm, 20}, {ESwarmPartId::LeftHand, 15}},
+		Shipments));
+	TestEqual(TEXT("Relay shipment count"), Shipments.Num(), 3);
+	ExpectShipment(Shipments, 0, {ESwarmPartId::Torso, ESwarmPartId::LeftArm}, 20);
+	ExpectShipment(Shipments, 1, {ESwarmPartId::LeftArm, ESwarmPartId::LeftHand}, 2);
+	ExpectShipment(Shipments, 2, {ESwarmPartId::Torso, ESwarmPartId::LeftArm, ESwarmPartId::LeftHand}, 3);
+
+	// 팔이 0개면 손으로 가는 몫 전부가 팔을 건너뛴다.
+	TestTrue(TEXT("Empty relay plan"), FSwarmTransferPlanner::Plan(Parents,
+		{{ESwarmPartId::Torso, 50}, {ESwarmPartId::Head, 10}, {ESwarmPartId::LeftArm, 0}, {ESwarmPartId::LeftHand, 0}},
+		{{ESwarmPartId::Torso, 40}, {ESwarmPartId::Head, 10}, {ESwarmPartId::LeftArm, 6}, {ESwarmPartId::LeftHand, 4}},
+		Shipments));
+	TestEqual(TEXT("Empty relay shipment count"), Shipments.Num(), 2);
+	ExpectShipment(Shipments, 0, {ESwarmPartId::Torso, ESwarmPartId::LeftArm}, 6);
+	ExpectShipment(Shipments, 1, {ESwarmPartId::Torso, ESwarmPartId::LeftArm, ESwarmPartId::LeftHand}, 4);
+
+	// 바꿀 것이 없으면 빈 계획으로 성공한다.
+	const TMap<ESwarmPartId, int32> Balanced =
+		{{ESwarmPartId::Torso, 40}, {ESwarmPartId::Head, 10}, {ESwarmPartId::LeftArm, 20}, {ESwarmPartId::LeftHand, 20}};
+	TestTrue(TEXT("Balanced plan"), FSwarmTransferPlanner::Plan(Parents, Balanced, Balanced, Shipments));
+	TestEqual(TEXT("Balanced plan is empty"), Shipments.Num(), 0);
+
+	// 개수 합이 다르거나, 최상위가 둘이거나, 부모가 순환하면 거부한다.
+	TestFalse(TEXT("Count sum mismatch rejected"), FSwarmTransferPlanner::Plan(Parents, Balanced,
+		{{ESwarmPartId::Torso, 41}, {ESwarmPartId::Head, 10}, {ESwarmPartId::LeftArm, 20}, {ESwarmPartId::LeftHand, 20}},
+		Shipments));
+
+	TMap<ESwarmPartId, ESwarmPartId> TwoRoots = Parents;
+	TwoRoots[ESwarmPartId::Head] = ESwarmPartId::None;
+	TestFalse(TEXT("Two roots rejected"), FSwarmTransferPlanner::Plan(TwoRoots, Balanced, Balanced, Shipments));
+
+	TMap<ESwarmPartId, ESwarmPartId> Cycle = Parents;
+	Cycle[ESwarmPartId::LeftArm] = ESwarmPartId::LeftHand;
+	TestFalse(TEXT("Cycle rejected"), FSwarmTransferPlanner::Plan(Cycle, Balanced, Balanced, Shipments));
+
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FSwarmNeighborTransferTest, "SwarmBoss.Stage2.NeighborTransfer",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+// Manager 재분배가 이웃 전달 계획대로 구체 소속을 바꾸는지, 길목이 모자라면 몸통 구체가 팔을 건너뛰어 손으로 가는지,
+// 보낼 구체를 관절에 가까운 것부터 고르는지 검증한다.
+bool FSwarmNeighborTransferTest::RunTest(const FString& Parameters)
+{
+	UWorld* World = UWorld::CreateWorld(EWorldType::Game, false);
+
+	if (!TestNotNull(TEXT("Transient world"), World))
+	{
+		return false;
+	}
+
+	ASwarmBossManager* Boss = World->SpawnActor<ASwarmBossManager>();
+
+	if (!TestNotNull(TEXT("Manager"), Boss))
+	{
+		World->DestroyWorld(false);
+		return false;
+	}
+
+	// 몸통 2, 왼팔 1, 왼손 1(왼팔의 자식, 왼팔 아랫면에 붙음). 기본 90개는 46/22/22(나머지 1은 몸통).
+	USwarmFormDefinition* Definition = CreateTwoPartDefinition();
+	FSwarmPartDefinition& HandDefinition = Definition->Parts.AddDefaulted_GetRef();
+	HandDefinition.PartId = ESwarmPartId::LeftHand;
+	HandDefinition.ParentPartId = ESwarmPartId::LeftArm;
+	HandDefinition.Shape = ESwarmPrimitive::Box;
+	HandDefinition.BoxHalfExtentsRatio = FVector(0.5, 0.5, 0.5);
+	HandDefinition.AllocationWeight = 1;
+	HandDefinition.ParentAnchor = FVector(0.0, 0.0, -1.0);
+	HandDefinition.ChildAnchor = FVector(0.0, 0.0, 1.0);
+	HandDefinition.Gap = 10.0f;
+	Boss->SetFormDefinition(Definition);
+
+	if (!TestTrue(TEXT("Three part chain generates"), Boss->GenerateInitialParts()))
+	{
+		World->DestroyWorld(false);
+		return false;
+	}
+
+	UInstancedStaticMeshComponent* Arm = Boss->GetPartInstances(ESwarmPartId::LeftArm);
+	UInstancedStaticMeshComponent* Hand = Boss->GetPartInstances(ESwarmPartId::LeftHand);
+
+	// 왼팔 20개(2개 남음), 왼손 10개(12개 남음)를 제거한다. 합계 60의 목표는 몸통 30, 왼팔 15, 왼손 15이므로
+	// 몸통 → 왼팔 16, 왼팔 → 왼손 3이 필요하고, 왼팔은 2개만 있으므로 몸통 구체 1개가 왼팔을 건너뛰어 왼손으로 간다.
+	for (int32 Index = 0; Index < 20; ++Index)
+	{
+		TestTrue(TEXT("Remove arm particle"), Boss->RemoveInstance(Arm, 0));
+	}
+
+	for (int32 Index = 0; Index < 10; ++Index)
+	{
+		TestTrue(TEXT("Remove hand particle"), Boss->RemoveInstance(Hand, 0));
+	}
+
+	TArray<ESwarmPartId> PartsBefore;
+
+	for (const FSwarmParticle& Particle : Boss->GetParticles())
+	{
+		PartsBefore.Add(Particle.bActive ? Particle.PartId : ESwarmPartId::None);
+	}
+
+	if (TestTrue(TEXT("Neighbor rebalance succeeds"), Boss->RebalancePartsFromDefinition()))
+	{
+		TestEqual(TEXT("Torso count"), CountActivePartParticles(*Boss, ESwarmPartId::Torso), 30);
+		TestEqual(TEXT("Arm count"), CountActivePartParticles(*Boss, ESwarmPartId::LeftArm), 15);
+		TestEqual(TEXT("Hand count"), CountActivePartParticles(*Boss, ESwarmPartId::LeftHand), 15);
+
+		int32 TorsoToArm = 0;
+		int32 TorsoToHand = 0;
+		int32 ArmToHand = 0;
+		int32 OtherMoves = 0;
+
+		for (int32 ParticleId = 0; ParticleId < Boss->GetParticles().Num(); ++ParticleId)
+		{
+			const FSwarmParticle& Particle = Boss->GetParticles()[ParticleId];
+			const ESwarmPartId Before = PartsBefore[ParticleId];
+
+			if (!Particle.bActive || Before == Particle.PartId)
+			{
+				continue;
+			}
+
+			if (Before == ESwarmPartId::Torso && Particle.PartId == ESwarmPartId::LeftArm)
+			{
+				++TorsoToArm;
+			}
+			else if (Before == ESwarmPartId::Torso && Particle.PartId == ESwarmPartId::LeftHand)
+			{
+				++TorsoToHand;
+			}
+			else if (Before == ESwarmPartId::LeftArm && Particle.PartId == ESwarmPartId::LeftHand)
+			{
+				++ArmToHand;
+			}
+			else
+			{
+				++OtherMoves;
+			}
+		}
+
+		TestEqual(TEXT("Torso sends to arm"), TorsoToArm, 15);
+		TestEqual(TEXT("Torso skips the short arm to reach the hand"), TorsoToHand, 1);
+		TestEqual(TEXT("Arm sends all it has to the hand"), ArmToHand, 2);
+		TestEqual(TEXT("No other moves"), OtherMoves, 0);
+
+		// 전달 직후 구체는 아직 출발 위치에 있다. 몸통에서 나간 구체는 남은 몸통 구체보다 어깨 관절에 가까워야 한다.
+		const FVector Shoulder = Boss->GetJointWorldLocation(ESwarmPartId::Torso, ESwarmPartId::LeftArm);
+		double FarthestSent = 0.0;
+		double NearestKept = TNumericLimits<double>::Max();
+
+		for (int32 ParticleId = 0; ParticleId < Boss->GetParticles().Num(); ++ParticleId)
+		{
+			const FSwarmParticle& Particle = Boss->GetParticles()[ParticleId];
+
+			if (!Particle.bActive || PartsBefore[ParticleId] != ESwarmPartId::Torso)
+			{
+				continue;
+			}
+
+			const FVector WorldPosition = Boss->GetPartInstances(Particle.PartId)->GetComponentTransform().TransformPosition(
+				Particle.LocalPosition);
+			const double Distance = FVector::Dist(WorldPosition, Shoulder);
+
+			if (Particle.PartId == ESwarmPartId::Torso)
+			{
+				NearestKept = FMath::Min(NearestKept, Distance);
+			}
+			else
+			{
+				FarthestSent = FMath::Max(FarthestSent, Distance);
+			}
+		}
+
+		TestTrue(TEXT("Torso sends particles nearest the shoulder"), FarthestSent <= NearestKept + 1.e-3);
+	}
+
+	World->DestroyWorld(false);
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FSwarmManagerDensityTest, "SwarmBoss.Stage2.ManagerDensity",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+// Manager 기본 배치 계수로 거인 부위에 쓰는 도형(구, 몸통·팔·손발 비율 박스)이 여러 개수에서 샘플링에 성공하는지 확인한다.
+bool FSwarmManagerDensityTest::RunTest(const FString& Parameters)
+{
+	const FVector BoxRatios[] = {FVector(1.0, 0.75, 1.5), FVector(0.45, 0.45, 1.0), FVector(0.3, 0.3, 1.0), FVector(0.5, 0.5, 0.5)};
+	const int32 Counts[] = {2, 10, 100, 1000, 2000};
+
+	for (int32 Count : Counts)
+	{
+		FSwarmSamplingSettings Settings;
+		Settings.ParticleCount = Count;
+		Settings.PackingCoefficient = ManagerPackingCoefficient;
+		Settings.Shape = ESwarmPrimitive::Sphere;
+		const FSwarmSamplingResult SphereResult = FSwarmShapeSampler::GenerateTargets(Settings);
+		TestTrue(*FString::Printf(TEXT("Sphere %d succeeds (%s)"), Count, *SphereResult.Message), SphereResult.bSuccess);
+
+		for (const FVector& Ratio : BoxRatios)
+		{
+			Settings.Shape = ESwarmPrimitive::Box;
+			Settings.BoxHalfExtents = Ratio;
+			const FSwarmSamplingResult BoxResult = FSwarmShapeSampler::GenerateTargets(Settings);
+			TestTrue(*FString::Printf(TEXT("Box %s x %d succeeds (%s)"), *Ratio.ToString(), Count, *BoxResult.Message),
+				BoxResult.bSuccess);
+			AddInfo(FString::Printf(TEXT("Density Box %s Count=%d Attempts=%d Expansion=%.3f"),
+				*Ratio.ToString(), Count, BoxResult.Attempts, BoxResult.ExpansionRatio));
+		}
+	}
+
+	// 좌우 부위는 도형·비율·개수가 같아도 시드가 달라 서로 다른 배치가 나와야 한다. 같은 부위는 같은 배치를 재현한다.
+	TestNotEqual(TEXT("Left and right seeds differ"), ASwarmBossManager::GetPartSamplingSeed(ESwarmPartId::LeftArm),
+		ASwarmBossManager::GetPartSamplingSeed(ESwarmPartId::RightArm));
+
+	FSwarmSamplingSettings ArmSettings;
+	ArmSettings.Shape = ESwarmPrimitive::Box;
+	ArmSettings.BoxHalfExtents = FVector(0.45, 0.45, 1.0);
+	ArmSettings.ParticleCount = 100;
+	ArmSettings.PackingCoefficient = ManagerPackingCoefficient;
+	ArmSettings.Seed = ASwarmBossManager::GetPartSamplingSeed(ESwarmPartId::LeftArm);
+	const TArray<FVector> LeftPoints = FSwarmShapeSampler::GenerateTargets(ArmSettings).Points;
+	const TArray<FVector> LeftAgain = FSwarmShapeSampler::GenerateTargets(ArmSettings).Points;
+	ArmSettings.Seed = ASwarmBossManager::GetPartSamplingSeed(ESwarmPartId::RightArm);
+	const TArray<FVector> RightPoints = FSwarmShapeSampler::GenerateTargets(ArmSettings).Points;
+	TestTrue(TEXT("Same part reproduces its layout"), LeftPoints == LeftAgain);
+	TestFalse(TEXT("Left and right arms get different layouts"), LeftPoints == RightPoints);
+
+	return true;
+}
+
 #endif
+
