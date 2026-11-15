@@ -14,6 +14,8 @@
 #include "Boss/SwarmBossManager.h"
 #include "Boss/SwarmFormDefinition.h"
 #include "Boss/SwarmTransferPlanner.h"
+#include "Projectiles/SwarmProjectile.h"
+#include "Engine/StaticMeshActor.h"
 #include "SwarmShapePreview.h"
 #include "Components/InstancedStaticMeshComponent.h"
 #include "Engine/World.h"
@@ -1906,5 +1908,133 @@ bool FSwarmManagerDensityTest::RunTest(const FString& Parameters)
 	return true;
 }
 
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FSwarmProjectileTest, "SwarmBoss.Stage2.ProjectileAttack",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+// 관통 구체 투사체가 경로에 닿는 구체(중심이 경로에서 투사체 반지름 + 구체 반지름 안)를 모두 지우고 멈추지 않고 지나가는지,
+// 대응표가 유지되는지, 벽에 닿으면 사라지는지, 빈 공간에서는 그대로 날아가는지 검증한다.
+bool FSwarmProjectileTest::RunTest(const FString& Parameters)
+{
+	UWorld* World = UWorld::CreateWorld(EWorldType::Game, false);
+
+	if (!TestNotNull(TEXT("Transient world"), World))
+	{
+		return false;
+	}
+
+	ASwarmBossManager* Boss = SpawnTwoPartManager(World);
+
+	if (!TestNotNull(TEXT("Manager"), Boss) || !TestTrue(TEXT("Generate"), Boss->GenerateInitialParts()))
+	{
+		World->DestroyWorld(false);
+		return false;
+	}
+
+	constexpr float ProjectileRadius = 15.0f;
+	constexpr double ParticleRadius = 10.0;
+	constexpr double Tolerance = 0.5;
+
+	// 몸통 중심을 지나 +X로 날아가는 직선. 구체 중심과 이 직선 사이 거리로 닿는지 판단한다.
+	const FVector TorsoCenter = Boss->GetPartInstances(ESwarmPartId::Torso)->GetComponentLocation();
+	const FVector Direction(1.0, 0.0, 0.0);
+	const FVector LaunchLocation = TorsoCenter - Direction * 1000.0;
+
+	TArray<double> DistancesToPath;
+	TArray<bool> WasActive;
+
+	for (const FSwarmParticle& Particle : Boss->GetParticles())
+	{
+		const FVector WorldPosition = Particle.bActive
+			? Boss->GetPartInstances(Particle.PartId)->GetComponentTransform().TransformPosition(Particle.LocalPosition)
+			: FVector::ZeroVector;
+		DistancesToPath.Add(FMath::PointDistToLine(WorldPosition, Direction, LaunchLocation));
+		WasActive.Add(Particle.bActive);
+	}
+
+	ASwarmProjectile* Projectile = World->SpawnActor<ASwarmProjectile>(LaunchLocation, FRotator::ZeroRotator);
+
+	if (TestNotNull(TEXT("Projectile"), Projectile))
+	{
+		const int32 Before = Boss->GetActiveParticleCount();
+		Projectile->Launch(Direction, 6000.0f, ProjectileRadius);
+		bool bStopped = false;
+
+		// 0.05초 × 20 = 6000cm를 날아 몸 전체를 지나간다.
+		for (int32 Step = 0; Step < 20 && !bStopped; ++Step)
+		{
+			bStopped = Projectile->Advance(0.05f);
+		}
+
+		TestFalse(TEXT("Projectile passes through the swarm without stopping"), bStopped);
+		TestTrue(TEXT("Projectile removes particles along its path"), Projectile->GetTotalRemovedCount() > 0);
+		TestEqual(TEXT("Active count drops by the removed count"), Boss->GetActiveParticleCount(),
+			Before - Projectile->GetTotalRemovedCount());
+
+		bool bTouchingRemoved = true;
+		bool bFarKept = true;
+
+		for (int32 ParticleId = 0; ParticleId < Boss->GetParticles().Num(); ++ParticleId)
+		{
+			if (!WasActive[ParticleId])
+			{
+				continue;
+			}
+
+			const bool bActive = Boss->GetParticles()[ParticleId].bActive;
+			bTouchingRemoved &= !(DistancesToPath[ParticleId] < ProjectileRadius + ParticleRadius - Tolerance && bActive);
+			bFarKept &= !(DistancesToPath[ParticleId] > ProjectileRadius + ParticleRadius + Tolerance && !bActive);
+		}
+
+		TestTrue(TEXT("Every particle touching the path is removed"), bTouchingRemoved);
+		TestTrue(TEXT("Particles away from the path are kept"), bFarKept);
+
+		for (ESwarmPartId PartId : {ESwarmPartId::Torso, ESwarmPartId::LeftArm})
+		{
+			TestEqual(TEXT("ISM count matches part particle count"),
+				Boss->GetPartInstances(PartId)->GetInstanceCount(), CountActivePartParticles(*Boss, PartId));
+		}
+	}
+
+	// 벽(WorldStatic 상자)에 닿으면 멈추고 사라진다. 테스트용 임시 월드에는 World Context가 없어 파괴할 때 엔진 경고가 한 번 나온다.
+	AddExpectedMessage(TEXT("World has no context"), ELogVerbosity::Warning, EAutomationExpectedMessageFlags::Contains, 1, false);
+
+	const FVector WallLocation = TorsoCenter + FVector(0.0, 0.0, 5000.0);
+	AStaticMeshActor* Wall = World->SpawnActor<AStaticMeshActor>(WallLocation, FRotator::ZeroRotator);
+	UStaticMesh* CubeMesh = LoadObject<UStaticMesh>(nullptr, TEXT("/Engine/BasicShapes/Cube.Cube"));
+
+	if (TestNotNull(TEXT("Wall"), Wall) && TestNotNull(TEXT("Cube mesh"), CubeMesh))
+	{
+		Wall->GetStaticMeshComponent()->SetMobility(EComponentMobility::Movable);
+		Wall->GetStaticMeshComponent()->SetStaticMesh(CubeMesh);
+		Wall->GetStaticMeshComponent()->SetCollisionProfileName(UCollisionProfile::BlockAll_ProfileName);
+
+		ASwarmProjectile* WallShot = World->SpawnActor<ASwarmProjectile>(WallLocation - Direction * 500.0, FRotator::ZeroRotator);
+
+		if (TestNotNull(TEXT("Wall projectile"), WallShot))
+		{
+			WallShot->Launch(Direction, 6000.0f, ProjectileRadius);
+			TestTrue(TEXT("Projectile stops at a wall"), WallShot->Advance(0.1f));
+			TestTrue(TEXT("Projectile is destroyed at the wall"), !IsValid(WallShot) || WallShot->IsActorBeingDestroyed());
+		}
+	}
+
+	// 위쪽 빈 공간으로 쏘면 아무것도 닿지 않고 이동 거리만큼 앞으로 간다.
+	ASwarmProjectile* Miss = World->SpawnActor<ASwarmProjectile>(TorsoCenter + FVector(3000.0, 0.0, 0.0), FRotator::ZeroRotator);
+
+	if (TestNotNull(TEXT("Missing projectile"), Miss))
+	{
+		const FVector Start = Miss->GetActorLocation();
+		Miss->Launch(FVector(0.0, 1.0, 0.0), 6000.0f, ProjectileRadius);
+		TestFalse(TEXT("Projectile into empty space does not stop"), Miss->Advance(0.1f));
+		TestEqual(TEXT("Projectile into empty space removes nothing"), Miss->GetTotalRemovedCount(), 0);
+		TestTrue(TEXT("Projectile moves along its velocity"),
+			Miss->GetActorLocation().Equals(Start + FVector(0.0, 600.0, 0.0), 1.e-3));
+	}
+
+	World->DestroyWorld(false);
+	return true;
+}
+
 #endif
+
 

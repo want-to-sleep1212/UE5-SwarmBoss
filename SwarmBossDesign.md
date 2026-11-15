@@ -7,7 +7,7 @@
 
 ## 1. 작업 재개 지점
 
-**Manager는 `USwarmFormDefinition` Data Asset(`/Game/Data/DA_GiantForm`)의 부위 목록대로 ISM을 만들어 구체를 생성하고, T 재분배도 같은 데이터의 가중치를 사용한다. 부위 위치는 데이터의 연결점·Gap으로 부모 ISM 기준에서 계산하고, 가장 낮은 부위가 Manager 위치(발바닥)에 닿도록 몸통 높이를 자동으로 맞춘다. T 재분배는 모든 부위를 대상으로 부위 트리의 이웃끼리만 동시에 전달하며, 길목이 모자라면 일부 구체가 길목을 건너뛴다. 다음 작은 작업은 이웃 전달 Play 확인 후, 길목을 건너뛰는 구체가 관절 단면을 지나 흐르도록 하는 것이다(7장 4-2).** 거인 전체·검·변신을 한 번에 구현하지 않는다. 최근 대화에서 변신 구조를 먼저 검토한 이유는 이 데이터 구조를 나중에 크게 바꾸지 않기 위해서다.
+**Manager는 `USwarmFormDefinition` Data Asset(`/Game/Data/DA_GiantForm`)의 부위 목록대로 ISM을 만들어 구체를 생성하고, T 재분배도 같은 데이터의 가중치를 사용한다. 부위 위치는 데이터의 연결점·Gap으로 부모 ISM 기준에서 계산하고, 가장 낮은 부위가 Manager 위치(발바닥)에 닿도록 몸통 높이를 자동으로 맞춘다. T 재분배는 모든 부위를 대상으로 부위 트리의 이웃끼리만 동시에 전달하며, 길목이 모자라면 일부 구체가 길목을 건너뛴다. 다음 작은 작업은 관절 피벗과 부위 자세 적용으로 부위를 회전시키는 것이다(7장 3번).** 거인 전체·검·변신을 한 번에 구현하지 않는다. 최근 대화에서 변신 구조를 먼저 검토한 이유는 이 데이터 구조를 나중에 크게 바꾸지 않기 위해서다.
 
 읽을 순서:
 
@@ -17,7 +17,7 @@
 4. `Source/SwarmBoss/Boss/SwarmBossManager.h`: 소유 데이터와 공개 기능.
 5. 같은 `.cpp`의 `GenerateInitialParts`, `ValidateFormDefinition`, `SyncPartInstances`, `RemoveInstance`, `TransferParticle`, `RebalanceParts`, `RebalanceToCounts`, `RebalancePartsFromDefinition`, `UpdateParticleMovement`.
 6. `Source/SwarmBoss/Boss/SwarmTransferPlanner.h/.cpp`: 이웃 전달 계획(관절별 흐름과 길목 건너뛰기).
-7. `Source/SwarmBoss/SwarmBossPlayerController.cpp`: 실제 클릭/T 입력.
+7. `Source/SwarmBoss/SwarmBossPlayerController.cpp`: 관통 투사체 발사(왼쪽 버튼 단발)/T 입력. 투사체는 `Source/SwarmBoss/Projectiles/SwarmProjectile.h/.cpp`.
 8. `Source/SwarmBoss/Swarm/SwarmShapeSamplerTests.cpp`: 기존 동작의 검증 조건.
 
 Preview는 표시 실험용으로 정리되어 있다. 게임플레이를 Preview에 다시 넣거나 삭제한 `USwarmRuntimeComponent`를 복원하지 않는다.
@@ -60,10 +60,10 @@ d = 2 × ParticleRadius + SpacingMargin
 
 ### 생성 후 전수 검사의 사용 단계 — 2026-11-11 결정
 
-현재 `GenerateTargets()`의 일반 생성 성공 경로에는 독립적인 O(N²) `ValidateTargets()` 호출이 남아 있다. 초기 검증용이며 최종 실행 경로에서는 제외할 예정이다. 생성 중 공간 격자로 검사하는 거리·경계와 입력 검증·목표 개수·실패 처리는 계속 유지한다. 검증 함수와 자동 테스트는 삭제하지 않는다.
+2026-11-15 적용: `GenerateTargets()`의 생성 성공 경로에서 O(N²) `ValidateTargets()` 호출을 뺐다. 결과의 `MeasuredMinimumDistance`는 이제 채우지 않으며(0), 진단용 Preview만 생성 후 따로 `ValidateTargets()`로 잰다(생성 시간에는 포함하지 않음). 생성 중 공간 격자로 검사하는 거리·경계와 입력 검증·목표 개수·실패 처리는 계속 유지한다. 검증 함수와 자동 테스트는 삭제하지 않는다.
 
-- [ ] 최종 데모 전에 최초 생성·재구성·변신의 일반 실행 경로에서 중복 전수 검사 제외.
-- [ ] 자동 테스트의 독립 간격·경계 검사 유지 및 재검증.
+- [x] 최초 생성·재구성의 일반 실행 경로에서 중복 전수 검사 제외(2026-11-15). 변신도 같은 `GenerateTargets()`를 쓰므로 따로 할 일이 없다.
+- [x] 자동 테스트의 독립 간격·경계 검사 유지 및 재검증(`SamplingInvariants`, `EdgeCasesAndFailure`가 `ValidateTargets()`를 직접 호출).
 - [ ] 검사 포함/제외를 명시해 생성 시간 비교.
 
 ## 3. 현재 구현과 실행 흐름
@@ -120,11 +120,14 @@ ASwarmBossManager
 
 ### 피격과 삭제
 
-`왼쪽 클릭 → PlayerController.TraceSwarmParticle → 엔진 LineTraceSingleByObjectType → Manager.RemoveInstance → Store.DeactivateParticle`.
+`왼쪽 버튼 → PlayerController.TryFireProjectile(쿨타임 확인) → ASwarmProjectile.Advance(매 Tick 이동 구간을 구로 SweepMultiByObjectType) → Manager.RemoveHitInstances → Manager.RemoveInstance → Store.DeactivateParticle`.
 
-- 카메라 정면 10000cm, `ECC_GameTraceChannel3 = SwarmSphere` Object Type만 조회한다. `ECC_GameTraceChannel2 = PlayerProjectile`, ISM 프로필은 `SwarmSpherePreset`.
-- 현재는 디버그 클릭 Trace이며 실제 투사체 발사/관통 구현이 아니다. 다른 Object Type의 벽 등은 조회에서 제외한다.
-- 피격 컴포넌트로 부위를 먼저 찾고 `Hit.Item`을 그 부위의 `InstanceToParticle`로 변환한다.
+- 2026-11-15: 구체를 하나씩 클릭해 지우기가 번거로워(사용자 요청) 디버그 클릭 Trace를 투사체로 바꿨다. 이전 `TraceSwarmParticle`은 삭제했다. 처음 구현한 "선 충돌 + 맞은 지점 반경 40cm 제거 + 연사"는 사용자 의도(관통 구체, 겉모습 = 충돌 크기)와 달라 같은 날 아래 방식으로 대체했다.
+- 발사(사용자 결정): 왼쪽 버튼을 누를 때마다 한 발(단발), 쿨타임 `FireCooldown` 2초. 카메라 위치에서 `MuzzleOffset`(50cm) 앞에 생성해 카메라 정면으로 `ProjectileSpeed`(1500cm/s, 날아가는 모습이 보이는 속도)로 날린다. 3초 수명이라 사거리는 약 45m다. 값은 PlayerController의 `Swarm|Attack`에서 바꾼다.
+- 관통 구체(사용자 결정): 반지름 `ProjectileRadius` 15cm, 겉모습과 충돌 크기가 같다. 관통 한도 없이 경로에 닿는 구체를 모두 지우며 계속 날아가므로 지름 2 × (15 + 10) = 50cm 터널이 생긴다. 벽(WorldStatic·WorldDynamic)에 닿으면 그 앞까지만 지우고 사라진다. 발사자와 그 Pawn은 무시한다.
+- 판정은 엔진 조회 방식(가)이다. 투사체에는 충돌 컴포넌트가 없고, 매 Tick 이번 이동 구간을 같은 반지름의 구로 `SweepMultiByObjectType`(WorldStatic·WorldDynamic·`ECC_GameTraceChannel3 = SwarmSphere`) 조회한다. ISM 인스턴스마다 있는 충돌 바디를 엔진 물리 장면의 공간 자료구조가 찾아 주므로 직접 만든 O(N) 순회나 격자가 필요 없다. 충돌체 + `ProjectileMovementComponent` + Overlap 이벤트(나)와 비교해, 구체 쪽 충돌 프로필(`SwarmSpherePreset`)을 바꾸지 않아도 되고 `Advance()`로 테스트할 수 있어 골랐다. 두 방식 모두 매 프레임 갱신이 있다(Actor Tick 또는 컴포넌트 Tick).
+- `RemoveHitInstances`는 맞은 (부위 ISM, 인스턴스 번호)를 ParticleId로 바꿔 먼저 모은 뒤 하나씩 제거한다. 교환 삭제로 다른 구체의 인스턴스 번호가 바뀌므로 제거마다 ParticleId로 현재 번호를 다시 읽는다. 같은 구체의 중복 결과와 다른 Actor 결과는 건너뛴다.
+- 단일 제거 `RemoveInstance`는 피격 컴포넌트로 부위를 찾고 인스턴스 번호를 그 부위의 `InstanceToParticle`로 변환한다.
 - ISM 교환 삭제가 성공하면 중앙 개체를 비활성화하고 생존 수를 줄인다. 역방향 배열도 교환 삭제하고 이동한 마지막 개체의 `InstanceIndex`를 고친다.
 - 중앙 슬롯은 삭제·압축·재사용하지 않는다. ID는 한 번의 초기화 이후 생존 기간 동안 유지된다. 슬롯 풀, Generation Handle, 제거 대기 큐는 현재 구현하지 않는다.
 - 제거 후 자동 재구성은 없다. T 입력으로 요청한다. 실패 시 다음 프레임 자동 재시도도 없다.
@@ -133,7 +136,7 @@ ASwarmBossManager
 
 `TransferParticle(ParticleId, DestinationPartId)`는 현재 월드 Transform과 기존 목표 월드 위치를 목적지 부위 로컬로 변환한다. 목적지 ISM 추가 후 출발지 제거를 수행하며 출발지 제거 실패 시 방금 추가한 목적지 인스턴스를 되돌린다. 성공 시 양쪽 대응표와 중앙 PartId/InstanceIndex/로컬 좌표를 바꾼다. ID·생존 수·남은 이동 시간은 유지하고, 자체적으로 새 목표를 정하거나 Tick을 켜지는 않는다.
 
-`SelectPartParticleIds`는 중앙 배열 순서로 활성 개체를 선택한다. 관절 검색 TODO가 있지만 아직 공간 자료구조를 사용하지 않는다. `TransferParticlesToTargets`는 선택한 개체를 이전하고 전달 성공 개체에 목적지 로컬 목표를 순서대로 준다. 반환값은 실제 소속 이전 성공 수이며 실패 개체만 건너뛴다.
+`SelectPartParticleIds`는 중앙 배열 순서로 활성 개체를 선택한다. 재분배의 부위 간 전달은 관절에 가까운 순서로 고르는 `SelectParticlesNearest`를 쓰며, 아직 공간 자료구조 없이 부위 전체를 정렬한다. `TransferParticlesToTargets`는 선택한 개체를 이전하고 전달 성공 개체에 목적지 로컬 목표를 순서대로 준다. 반환값은 실제 소속 이전 성공 수이며 실패 개체만 건너뛴다.
 
 ### T 키 재분배
 
@@ -273,13 +276,13 @@ Manager 공통 기능: 생존 수 관리, 배분, 샘플러 호출, 목표 배�
 3. 거인 부위/그룹 이동·회전과 행동. 구체 고정 크기와 상대 좌표 유지 확인.
 4. 이웃 부위 전달. 3번보다 먼저 진행한다(사용자 결정, 2026-11-15).
    1. ~~관절별 흐름 계산, 동시 출발, 길목 건너뛰기, 관절에 가까운 구체 선택(이동은 직선).~~ 완료(2026-11-15).
-   2. 길목을 건너뛰는 구체만 관절 단면을 지나 이동.
+   2. 길목을 건너뛰는 구체만 관절 단면을 지나 이동. **보류(2026-11-15, 사용자 결정).** 건너뛰기 자체가 드물고, 건너뛰는 구체도 첫 관절 근처에서 출발하며 기본 자세에서는 직선 경로가 거의 비어 있는 중간 부위 근처를 지나 눈에 띄지 않는다. 3번에서 관절이 회전한 뒤 직선 이동이 몸 밖으로 벗어나 보이면 진행한다. 설계는 3장 T 키 재분배의 "이동" 항목을 그대로 쓴다.
    - 관절 공간 검색(공간 자료구조) 도입은 성능 필요성을 따로 판단.
 5. 고정 N자루 복합 검 구성과 행동.
 6. 계획 준비 → 무적 전환 → 직접 이동 → 도착 완료의 변신 흐름 연결.
 7. 극소수/실패 처리, 전수 검사 실행 분리, 성능 측정과 데모 마무리.
 
-이 목록 전체를 다음 한 번의 변경으로 구현하지 않는다. 데이터 기반 생성·T 재분배·부위 ISM 생성·부위 위치 규칙·모든 부위 재분배는 끝났으며 2-4 거인 10부위 입력과 Play 확인, 바닥 맞춤, 4-1 이웃 전달 계산도 끝났다. 바로 다음 작업은 4-1의 Play 확인과 4-2 관절 단면 경유 이동이며, 그 뒤 3번 부위 이동·회전으로 간다.
+이 목록 전체를 다음 한 번의 변경으로 구현하지 않는다. 데이터 기반 생성·T 재분배·부위 ISM 생성·부위 위치 규칙·모든 부위 재분배는 끝났으며 2-4 거인 10부위 입력과 Play 확인, 바닥 맞춤, 4-1 이웃 전달 계산도 끝났다. 4-1은 Play로 확인했고 4-2는 보류했다. 바로 다음 작업은 3번 부위 이동·회전(관절 피벗 → 자세 적용 → 키 입력으로 회전 확인)이다.
 
 ## 8. 검증과 작업 명령
 
@@ -290,6 +293,8 @@ Manager 공통 기능: 생존 수 관리, 배분, 샘플러 호출, 목표 배�
 이웃 전달: Editor 타깃 빌드 성공, 자동 테스트 14개 성공/실패0(`Saved/Automation/NeighborTransfer/index.json`, `reportCreatedOn` `2026.11.14-16.32.22` 보고서 표기 그대로). 로그에서 `Torso -> LeftArm -> LeftHand Requested=1` 길목 건너뛰기를 확인했다. 사용자 Editor Play에서 T 재분배가 동작함을 확인했다. 흐름이 육안으로 구분하기 어려워 `Reconstruction Duration`을 늘리거나 디버그 표시가 필요할 수 있다.
 
 배치 계수 0.5와 부위별 시드: Editor 타깃 빌드 성공, 자동 테스트 15개 성공/실패0(`Saved/Automation/PartSeed/index.json`, `reportCreatedOn` `2026.11.14-17.33.11` 보고서 표기 그대로). 사용자 Editor Play에서 밀도와 좌우 배치 차이를 확인했다.
+
+관통 구체 투사체와 생성 경로 전수 검사 제외: Editor 타깃 빌드 성공, 자동 테스트 16개 성공/경고0/실패0(`Saved/Automation/PiercingProjectile/index.json`, `reportCreatedOn` `2026.11.14-18.20.19` 보고서 표기 그대로). 테스트 로그 `Projectile passed through ... Removed=8`(구체 90개 몸통·왼팔). Editor Play는 아직 확인하지 않았다.
 
 바닥 맞춤: Editor 타깃 빌드 성공, 자동 테스트 12개 성공/실패0(`Saved/Automation/Grounding/index.json`, `reportCreatedOn` `2026.11.14-15.26.29` 보고서 표기 그대로). PartPlacement에서 몸통 상승량(손이 가장 낮은 4부위), 재분배 후 재계산, 활성 구체 목표가 Manager 높이 아래로 내려가지 않음, 빈 왼팔 제외를 확인했다. 사용자가 Manager를 바닥 높이에 놓은 Editor Play에서 바닥 맞춤을 확인했다.
 
@@ -316,6 +321,7 @@ T 재분배의 데이터 가중치 사용: Editor 타깃 빌드 성공, 자동 �
 | Stage2.PartPlacement | 연결점·Gap 위치 계산(박스·구형·회전), ISM 부착 계층, 재분배 시 관절 재계산과 구체 화면 위치 유지·재이동, 0개 부위 점 처리, 가장 낮은 부위 기준 바닥 맞춤 |
 | Stage2.TransferPlanner | 관절별 흐름 계산, 이웃끼리만 전달, 길목 부족·0개 시 경로 연장, 균형 시 빈 계획, 합 불일치·최상위 둘·순환 거부 |
 | Stage2.NeighborTransfer | Manager 재분배의 이웃 전달 소속 변화(몸통→팔 15, 팔→손 2, 몸통→팔→손 1), 관절에 가까운 구체 선택 |
+| Stage2.ProjectileAttack | 관통 구체가 경로에서 (투사체 반지름 + 구체 반지름) 안의 구체를 모두 지우고 밖은 남기며 멈추지 않음, 대응표 유지, 벽에서 정지·파괴, 빈 공간 비행 |
 | Stage2.ManagerDensity | Manager 기본 배치 계수(0.5)로 구·박스 4종 비율 × 2~2000개 생성 성공, 부위별 시드로 좌우 배치가 다르고 같은 부위는 재현 |
 | Stage2.FormDefinition | 데이터 누락, 가중치 배분과 잔여, 가중치 0, 잘못된 데이터 13종 거부, 데이터 목록대로 부위 ISM 생성·제거, 세 부위 데이터 가중치 재분배·이미 균형 시 유지, 목록 변경 시 재분배 거절, 데이터 가중치 재분배·변경 반영 |
 

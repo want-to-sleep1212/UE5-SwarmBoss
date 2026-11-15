@@ -14,7 +14,7 @@ Unreal Engine 5와 C++로 개발하는 군체 보스 프로토타입입니다. �
 
 - 구·박스 내부 3D Poisson Disk Sampling, 최소 간격과 배치 계수에 따른 크기 계산.
 - 중앙 `FSwarmParticleStore`와 부위별 ISM, 안정적인 `ParticleId`와 인스턴스 번호의 양방향 연결.
-- 클릭한 구체의 교환 삭제, 생존 수 관리, 위치를 유지하는 부위 간 소속 이전.
+- 경로의 구체를 모두 지우며 관통하는 구체 투사체(엔진 Sweep 조회)와 교환 삭제, 생존 수 관리, 위치를 유지하는 부위 간 소속 이전.
 - `USwarmFormDefinition` Data Asset(`DA_GiantForm`)에서 부위 도형·비율·배분 가중치를 읽어 생성하고, 데이터 유효성을 검사. 부위 ISM도 데이터의 부위 목록대로 Play 시작 시 생성.
 - 부위 위치는 부모·자식 연결점(크기 비율)과 관절 간격 `Gap`으로 계산하고, 자식 ISM을 부모 ISM에 붙여 관절 계층을 구성. 재분배로 크기가 바뀌면 관절 위치를 다시 계산. 가장 낮은 부위의 구체 표면이 Manager 위치에 닿도록 몸 전체 높이를 자동으로 맞춤(Manager 위치 = 발바닥).
 - 데이터 가중치(현재 시험값, 미확정)에 따른 모든 부위 재분배와 생존 수에 맞춘 목표 재생성·순차 배정. 부위 간 이동은 부위 트리의 이웃끼리만, 모든 관절에서 동시에 일어나며 관절에 가까운 구체부터 보냄. 중간 부위가 모자라면 일부 구체가 그 부위를 건너뛰어 다음 부위로 감.
@@ -39,7 +39,7 @@ git lfs pull
 2. FirstPerson 데모 레벨에서 `SwarmBossManager` Actor를 배치합니다. 이미 있으면 중복 배치하지 않습니다. Manager 위치가 거인의 발바닥이므로 바닥 높이에 놓습니다. Manager Actor는 Git으로 추적하지 않으므로 새로 받은 저장소에서는 직접 배치합니다.
 3. Details의 `Swarm|Generation`에서 `Form Definition`에 `/Game/Data/DA_GiantForm`을 지정합니다. 비어 있으면 Play 시 구체를 생성하지 않고 Output Log에 경고만 남깁니다.
 4. `Initial Particle Count`, `Reconstruction Duration`을 설정하고 Play를 누릅니다. Manager는 Play 시작 시 생성합니다. 부위 간 위치와 간격은 `DA_GiantForm`의 부위별 `Parent Anchor`, `Child Anchor`, `Gap`으로 정합니다.
-5. `ASwarmBossPlayerController`를 사용하는 플레이어로 중앙 조준선을 맞추고 왼쪽 클릭하면 구체 하나가 제거됩니다.
+5. `ASwarmBossPlayerController`를 사용하는 플레이어로 중앙 조준선을 맞추고 왼쪽 버튼을 누르면 반지름 15cm 관통 구체가 날아가 경로의 구체를 모두 지웁니다. 쿨타임은 2초입니다. 쿨타임·속도·반지름은 PlayerController의 `Swarm|Attack`에서 바꿉니다.
 6. `T`를 누르면 모든 부위의 생존 합계를 `DA_GiantForm`의 가중치 비율로 맞추고 새 목표로 이동합니다. 이미 개수 비율이 맞으면 재생성하지 않습니다.
 
 `R` 재구성과 `T` 1,000cm 이동은 과거 테스트 입력입니다. 현재 T는 재분배이며 R은 연결되어 있지 않습니다. Preview만 배치하면 현재 게임플레이 기능을 시험할 수 없습니다.

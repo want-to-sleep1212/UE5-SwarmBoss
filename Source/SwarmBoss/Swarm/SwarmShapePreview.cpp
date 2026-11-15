@@ -46,7 +46,15 @@ void ASwarmShapePreview::BeginPlay()
 // 성공한 좌표로 미리보기 구체를 교체하고, 적용한 도형 크기와 생성 결과를 Details에 기록한다.
 void ASwarmShapePreview::GeneratePreview()
 {
-	const FSwarmSamplingResult Result = FSwarmShapeSampler::GenerateTargets(Settings);
+	FSwarmSamplingResult Result = FSwarmShapeSampler::GenerateTargets(Settings);
+
+	// 생성 경로는 전수 검사를 하지 않으므로, 진단용 Preview에서만 실제 최소 간격을 따로 잰다(생성 시간에는 포함하지 않는다).
+	if (Result.bSuccess && !FSwarmShapeSampler::ValidateTargets(Result.Points, Settings.Shape, Result.HalfExtents,
+		Result.MinimumDistance, Result.MeasuredMinimumDistance))
+	{
+		UE_LOG(LogSwarmShape, Warning, TEXT("Preview targets failed spacing/bounds validation."));
+	}
+
 	LastReport = FString::Printf(TEXT("%s Requested=%d Produced=%d Attempts=%d Expansion=%.2f%% MinDistance=%.3f Measured=%.3f Tests=%d Time=%.2fms"),
 		*Result.Message, Settings.ParticleCount, Result.Points.Num(), Result.Attempts, Result.ExpansionRatio * 100.0,
 		Result.MinimumDistance, Result.MeasuredMinimumDistance, Result.CandidateTests, Result.ElapsedMilliseconds);

@@ -9,6 +9,7 @@
 #include "SwarmCrosshairHUD.h"
 #include "InputCoreTypes.h"
 #include "Boss/SwarmBossManager.h"
+#include "Projectiles/SwarmProjectile.h"
 
 #include "EnhancedInputSubsystems.h"
 #include "Engine/LocalPlayer.h"
@@ -57,7 +58,7 @@ void ASwarmBossPlayerController::BeginPlay()
 	}
 }
 
-// 로컬 플레이어의 클릭 제거와 T 키 부위 전달 테스트 입력, 입력 매핑을 등록한다.
+// 로컬 플레이어의 투사체 발사(왼쪽 버튼 단발)와 T 키 재분배 테스트 입력, 입력 매핑을 등록한다.
 void ASwarmBossPlayerController::SetupInputComponent()
 {
 	Super::SetupInputComponent();
@@ -69,7 +70,7 @@ void ASwarmBossPlayerController::SetupInputComponent()
 			EKeys::LeftMouseButton,
 			IE_Pressed,
 			this,
-			&ASwarmBossPlayerController::TraceSwarmParticle);
+			&ASwarmBossPlayerController::TryFireProjectile);
 
 		InputComponent->BindKey(
 			EKeys::T,
@@ -111,9 +112,9 @@ bool ASwarmBossPlayerController::ShouldUseTouchControls() const
 	return SVirtualJoystick::ShouldDisplayTouchInterface() || bForceTouchControls;
 }
 
-// 플레이어 카메라 정면으로 SwarmSphere 충돌 타입을 검사해 처음 맞은 구체를 찾는다.
-// 피격 Actor가 ASwarmBossManager이면 메시 컴포넌트와 Hit.Item 인스턴스 번호를 직접 넘겨 구체 제거를 요청한다.
-void ASwarmBossPlayerController::TraceSwarmParticle()
+// 쿨타임이 지났으면 플레이어 카메라 위치에서 MuzzleOffset만큼 앞에 관통 구체 투사체를 만들고 카메라 정면으로 발사한다.
+// 쿨타임 중이면 아무것도 하지 않는다. 피격 판정과 구체 제거는 투사체(ASwarmProjectile)가 맡는다.
+void ASwarmBossPlayerController::TryFireProjectile()
 {
 	UWorld* World = GetWorld();
 
@@ -122,43 +123,30 @@ void ASwarmBossPlayerController::TraceSwarmParticle()
 		return;
 	}
 
-	// 마우스 커서 위치가 아닌 플레이어 카메라의 정면을 사용한다.
+	const double Now = World->GetTimeSeconds();
+
+	if (LastFireTime >= 0.0 && Now - LastFireTime < FireCooldown)
+	{
+		return;
+	}
+
 	FVector ViewLocation;
 	FRotator ViewRotation;
 	GetPlayerViewPoint(ViewLocation, ViewRotation);
 
-	constexpr float TraceDistance = 10000.0f;
-	const FVector TraceEnd = ViewLocation + ViewRotation.Vector() * TraceDistance;
+	const FVector Direction = ViewRotation.Vector();
+	FActorSpawnParameters SpawnParameters;
+	SpawnParameters.Owner = this;
+	SpawnParameters.Instigator = GetPawn();
+	SpawnParameters.SpawnCollisionHandlingOverride = ESpawnActorCollisionHandlingMethod::AlwaysSpawn;
 
-	// SwarmSphere는 Trace Channel이 아닌 Object Channel이다.
-	// 디버그 식별 검사이므로 벽 등 다른 Object Type은 검사 대상에서 제외한다.
-	FCollisionObjectQueryParams ObjectQuery;
-	ObjectQuery.AddObjectTypesToQuery(ECC_GameTraceChannel3);
+	ASwarmProjectile* Projectile = World->SpawnActor<ASwarmProjectile>(
+		ViewLocation + Direction * MuzzleOffset, ViewRotation, SpawnParameters);
 
-	FCollisionQueryParams QueryParams(SCENE_QUERY_STAT(SwarmParticleTrace), false);
-
-	FHitResult Hit;
-	const bool bHit = World->LineTraceSingleByObjectType(
-		Hit,
-		ViewLocation,
-		TraceEnd,
-		ObjectQuery,
-		QueryParams);
-
-	if (!bHit)
+	if (Projectile)
 	{
-		UE_LOG(LogSwarmBoss, Display, TEXT("Swarm trace: no sphere hit."));
-		return;
-	}
-
-	ASwarmBossManager* Boss = Cast<ASwarmBossManager>(Hit.GetActor());
-
-	if (!Boss || !Boss->RemoveInstance(Hit.GetComponent(), Hit.Item))
-	{
-		UE_LOG(LogSwarmBoss, Warning,
-			TEXT("Swarm trace: invalid boss manager or instance. Actor=%s Instance=%d"),
-			*GetNameSafe(Hit.GetActor()),
-			Hit.Item);
+		Projectile->Launch(Direction, ProjectileSpeed, ProjectileRadius);
+		LastFireTime = Now;
 	}
 }
 

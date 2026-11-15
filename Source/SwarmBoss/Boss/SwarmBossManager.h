@@ -55,6 +55,9 @@ public:
 	void SetFormDefinition(USwarmFormDefinition* NewFormDefinition);
 
 	bool RemoveInstance(const UPrimitiveComponent* HitComponent, int32 InstanceIndex);
+
+	// 여러 피격 결과(Hit.GetActor()가 이 Manager, Hit.Item이 인스턴스 번호)에 해당하는 구체를 모두 제거하고 제거한 수를 반환한다.
+	int32 RemoveHitInstances(TConstArrayView<FHitResult> Hits);
 	bool TransferParticle(int32 ParticleId, ESwarmPartId DestinationPartId);
 
 	int32 TransferParticlesToTargets(ESwarmPartId SourcePartId, ESwarmPartId DestinationPartId,

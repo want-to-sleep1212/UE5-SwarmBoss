@@ -82,6 +82,7 @@ struct SWARMBOSS_API FSwarmSamplingResult
 	TArray<FVector> Points;
 	FVector HalfExtents = FVector::ZeroVector;
 	double MinimumDistance = 0.0;
+	// GenerateTargets()는 채우지 않는다(0). 필요하면 ValidateTargets()로 따로 잰다.
 	double MeasuredMinimumDistance = 0.0;
 	double ExpansionRatio = 0.0;
 	double ElapsedMilliseconds = 0.0;

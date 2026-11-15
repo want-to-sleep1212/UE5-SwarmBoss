@@ -130,3 +130,6 @@ Desktop.ini
 !/Content/__ExternalActors__/FirstPerson/Lvl_FirstPerson/D/BL/WB7S47W2IE4F23EZ9SLQ1B.uasset
 !/Content/__ExternalActors__/FirstPerson/Lvl_FirstPerson/D/C7/LHEOZ28EA00LZG55QEAGFH.uasset
 !/Content/__ExternalObjects__/FirstPerson/Lvl_FirstPerson/1/E5/IOQOGT9AJYYZQ06SOLO6RW.uasset
+
+# Claude Code 로컬 작업 규칙 (저장소에 포함하지 않음)
+/CLAUDE.md

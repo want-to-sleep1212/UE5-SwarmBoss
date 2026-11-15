@@ -1,10 +1,10 @@
 // SwarmShapeSampler.cpp
 // FSwarmShapeSampler 구현.
 // - GenerateTargets(): 설정 검증 → 필요 부피 V = N·d³/k로 도형 크기 계산 → Bridson 방식 샘플링
-//   (활성점, d~2d 구각 후보, 셀 크기 d 격자의 27셀 이웃 검사) → 영역 전체를 채운 뒤 N개를 무작위 부분 선택 → 검증.
+//   (활성점, d~2d 구각 후보, 셀 크기 d 격자의 27셀 이웃 검사) → 영역 전체를 채운 뒤 N개를 무작위 부분 선택.
 //   개수가 부족하면 MaxExpansionRatio 안에서 영역을 넓혀 재시도하고, 후보 검사 예산을 넘으면 즉시 실패한다.
 // - Contains(): 점이 구·박스 중심 허용 영역 안에 있는지 판정한다.
-// - ValidateTargets(): 경계와 최소 간격을 O(N²) 전수 검사로 독립 검증한다(생성 시 1회, 매 프레임 사용 금지).
+// - ValidateTargets(): 경계와 최소 간격을 O(N²) 전수 검사로 독립 검증한다. 생성 경로에서는 호출하지 않고 자동 테스트와 Preview 진단에서만 쓴다.
 
 #include "SwarmShapeSampler.h"
 
@@ -249,9 +249,10 @@ FSwarmSamplingResult FSwarmShapeSampler::GenerateTargets(const FSwarmSamplingSet
 			}
 			Result.Points.SetNum(S.ParticleCount, EAllowShrinking::No);
 
-			Result.bSuccess = ValidateTargets(Result.Points, S.Shape, Result.HalfExtents,
-				Result.MinimumDistance, Result.MeasuredMinimumDistance);
-			return Finish(Result.bSuccess ? TEXT("Success.") : TEXT("Target validation failed."));
+			// 간격·경계는 생성 중 격자 검사로 이미 지켰으므로 O(N²) 전수 검사(ValidateTargets)는 다시 하지 않는다.
+			// 독립 검증은 자동 테스트가 맡는다(2026-11-11 결정, 2026-11-15 적용).
+			Result.bSuccess = true;
+			return Finish(TEXT("Success."));
 		}
 	}
 

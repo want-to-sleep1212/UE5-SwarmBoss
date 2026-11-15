@@ -807,6 +807,40 @@ FSwarmPart* ASwarmBossManager::FindPartByComponent(const UPrimitiveComponent* Hi
 	return nullptr;
 }
 
+// 투사체 Sweep처럼 한 번에 여러 구체를 맞힌 결과에서 이 Manager의 구체를 모두 제거하고 제거한 수를 반환한다.
+// 먼저 맞은 (부위 ISM, 인스턴스 번호)를 ParticleId로 바꿔 모은 뒤 하나씩 제거한다. 교환 삭제로 다른 구체의 인스턴스 번호가
+// 바뀌므로, 인스턴스 번호를 미리 모아 두지 않고 제거할 때마다 ParticleId로 현재 번호를 다시 읽는다.
+// 다른 Actor·컴포넌트의 결과, 잘못된 인스턴스 번호, 같은 구체의 중복 결과는 건너뛴다.
+int32 ASwarmBossManager::RemoveHitInstances(TConstArrayView<FHitResult> Hits)
+{
+	TArray<int32> HitParticleIds;
+
+	for (const FHitResult& Hit : Hits)
+	{
+		const FSwarmPart* Part = Hit.GetActor() == this ? FindPartByComponent(Hit.GetComponent()) : nullptr;
+
+		if (Part && Part->InstanceToParticle.IsValidIndex(Hit.Item))
+		{
+			HitParticleIds.AddUnique(Part->InstanceToParticle[Hit.Item]);
+		}
+	}
+
+	int32 RemovedCount = 0;
+
+	for (int32 ParticleId : HitParticleIds)
+	{
+		const FSwarmParticle& Particle = ParticleStore.GetParticles()[ParticleId];
+		const FSwarmPart* Part = Parts.Find(Particle.PartId);
+
+		if (Particle.bActive && Part && RemoveInstance(Part->Instances, Particle.InstanceIndex))
+		{
+			++RemovedCount;
+		}
+	}
+
+	return RemovedCount;
+}
+
 // HitComponent가 가리키는 도형에서 InstanceIndex번 구체를 제거한다.
 // 마지막 메시 인스턴스가 삭제된 자리를 채우면, 그 구체의 InstanceIndex와 InstanceToParticle을 함께 갱신한다.
 // 제거한 구체는 Particles 배열에 비활성 상태로 남기며, 실제 삭제가 성공했을 때 true를 반환한다.
