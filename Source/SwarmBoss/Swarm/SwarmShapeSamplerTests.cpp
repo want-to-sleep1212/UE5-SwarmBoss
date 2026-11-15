@@ -9,11 +9,13 @@
 
 #if WITH_DEV_AUTOMATION_TESTS
 #include "Misc/AutomationTest.h"
+#include "Algo/Reverse.h"
 #include "UObject/UnrealType.h"
 #include <limits>
 #include "Boss/SwarmBossManager.h"
 #include "Boss/SwarmFormDefinition.h"
 #include "Boss/SwarmTransferPlanner.h"
+#include "Swarm/SwarmTargetAssigner.h"
 #include "Projectiles/SwarmProjectile.h"
 #include "Engine/StaticMeshActor.h"
 #include "SwarmShapePreview.h"
@@ -71,13 +73,16 @@ namespace
 	}
 
 	// World에 Manager를 생성하고 몸통:왼팔 2:1 형태 데이터를 지정한다. 구체는 아직 생성하지 않는다.
-	ASwarmBossManager* SpawnTwoPartManager(UWorld* World)
+	// 제거·이동·전달 같은 개별 동작을 검증하는 테스트가 Tick에서 자동 재분배에 섞이지 않도록 기본은 손실 자동 재분배를 끈다.
+	// 자동 재분배는 AutoRebalance·ProjectileAttack 테스트가 켜고 검증한다.
+	ASwarmBossManager* SpawnTwoPartManager(UWorld* World, bool bAutoRebalanceOnLoss = false)
 	{
 		ASwarmBossManager* Boss = World->SpawnActor<ASwarmBossManager>();
 
 		if (Boss)
 		{
 			Boss->SetFormDefinition(CreateTwoPartDefinition());
+			Boss->SetAutoRebalanceOnLoss(bAutoRebalanceOnLoss);
 		}
 
 		return Boss;
@@ -1922,7 +1927,7 @@ bool FSwarmProjectileTest::RunTest(const FString& Parameters)
 		return false;
 	}
 
-	ASwarmBossManager* Boss = SpawnTwoPartManager(World);
+	ASwarmBossManager* Boss = SpawnTwoPartManager(World, /*bAutoRebalanceOnLoss=*/true);
 
 	if (!TestNotNull(TEXT("Manager"), Boss) || !TestTrue(TEXT("Generate"), Boss->GenerateInitialParts()))
 	{
@@ -1987,6 +1992,8 @@ bool FSwarmProjectileTest::RunTest(const FString& Parameters)
 
 		TestTrue(TEXT("Every particle touching the path is removed"), bTouchingRemoved);
 		TestTrue(TEXT("Particles away from the path are kept"), bFarKept);
+		TestEqual(TEXT("Damage window closes after leaving the swarm bounds"), Boss->GetOpenDamageWindowCount(), 0);
+		TestTrue(TEXT("Loss waits for the next Tick to rebalance"), Boss->IsRebalancePending());
 
 		for (ESwarmPartId PartId : {ESwarmPartId::Torso, ESwarmPartId::LeftArm})
 		{
@@ -1995,8 +2002,27 @@ bool FSwarmProjectileTest::RunTest(const FString& Parameters)
 		}
 	}
 
-	// 벽(WorldStatic 상자)에 닿으면 멈추고 사라진다. 테스트용 임시 월드에는 World Context가 없어 파괴할 때 엔진 경고가 한 번 나온다.
-	AddExpectedMessage(TEXT("World has no context"), ELogVerbosity::Warning, EAutomationExpectedMessageFlags::Contains, 1, false);
+	// 보스 안에서 사라지면(바닥·벽·수명 등) EndPlay에서 피해 구간을 닫는다. 첫 투사체의 터널과 겹치지 않게 +Y로 쏜다.
+	// 테스트용 임시 월드에는 World Context가 없어 Actor를 파괴할 때마다 엔진 경고가 나온다(횟수 무관).
+	AddExpectedMessage(TEXT("World has no context"), ELogVerbosity::Warning, EAutomationExpectedMessageFlags::Contains, 0, false);
+
+	ASwarmProjectile* Inside = World->SpawnActor<ASwarmProjectile>(TorsoCenter - FVector(0.0, 1000.0, 0.0), FRotator::ZeroRotator);
+
+	if (TestNotNull(TEXT("Inside projectile"), Inside))
+	{
+		Inside->Launch(FVector(0.0, 1.0, 0.0), 6000.0f, ProjectileRadius);
+
+		for (int32 Step = 0; Step < 200 && Boss->GetOpenDamageWindowCount() == 0; ++Step)
+		{
+			Inside->Advance(0.01f);
+		}
+
+		TestEqual(TEXT("Hitting the swarm opens a damage window"), Boss->GetOpenDamageWindowCount(), 1);
+		Inside->Destroy();
+		TestEqual(TEXT("Destroying inside the swarm closes the window"), Boss->GetOpenDamageWindowCount(), 0);
+	}
+
+	// 벽(WorldStatic 상자)에 닿으면 멈추고 사라진다.
 
 	const FVector WallLocation = TorsoCenter + FVector(0.0, 0.0, 5000.0);
 	AStaticMeshActor* Wall = World->SpawnActor<AStaticMeshActor>(WallLocation, FRotator::ZeroRotator);
@@ -2035,6 +2061,224 @@ bool FSwarmProjectileTest::RunTest(const FString& Parameters)
 	return true;
 }
 
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FSwarmTargetAssignerTest, "SwarmBoss.Stage2.TargetAssigner",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+// 가까운 목표 배정(그리디)의 기본 성질과 통계를 검증한다. 같은 위치면 이동 0, 조금 밀린 격자는 바로 옆 목표,
+// 개수가 다르면 거부, 같은 입력이면 같은 결과이고 모든 목표를 한 번씩 쓴다. 그리디가 먼 이동을 남기는 경우는 통계로 드러난다.
+bool FSwarmTargetAssignerTest::RunTest(const FString& Parameters)
+{
+	constexpr double Spacing = 22.0;
+	FSwarmAssignSettings Settings;
+	Settings.CellSize = Spacing;
+	Settings.LongMoveThreshold = 2.0 * Spacing;
+
+	TArray<FVector> Grid;
+
+	for (int32 X = 0; X < 5; ++X)
+	{
+		for (int32 Y = 0; Y < 5; ++Y)
+		{
+			for (int32 Z = 0; Z < 5; ++Z)
+			{
+				Grid.Add(FVector(X, Y, Z) * Spacing);
+			}
+		}
+	}
+
+	// 시작 위치가 목표와 같으면(순서는 반대) 모두 제자리 목표를 받는다.
+	TArray<FVector> Reversed = Grid;
+	Algo::Reverse(Reversed);
+	TArray<int32> Assignment;
+	FSwarmAssignStats Stats;
+
+	if (TestTrue(TEXT("Identity assign succeeds"), FSwarmTargetAssigner::Assign(Reversed, Grid, Settings, Assignment, &Stats)))
+	{
+		bool bSame = true;
+
+		for (int32 Index = 0; Index < Reversed.Num(); ++Index)
+		{
+			bSame &= Reversed[Index] == Grid[Assignment[Index]];
+		}
+
+		TestTrue(TEXT("Every start keeps its own position"), bSame);
+		TestEqual(TEXT("Identity max move is zero"), Stats.MaxMove, 0.0);
+		TestEqual(TEXT("Identity has no leftovers"), Stats.Leftovers, 0);
+	}
+
+	// 격자 전체를 5cm 밀면 모두 바로 옆(원래 칸) 목표로 간다.
+	TArray<FVector> Shifted;
+
+	for (const FVector& Point : Grid)
+	{
+		Shifted.Add(Point + FVector(5.0, 0.0, 0.0));
+	}
+
+	if (TestTrue(TEXT("Shifted assign succeeds"), FSwarmTargetAssigner::Assign(Shifted, Grid, Settings, Assignment, &Stats)))
+	{
+		bool bNeighbor = true;
+
+		for (int32 Index = 0; Index < Shifted.Num(); ++Index)
+		{
+			bNeighbor &= Assignment[Index] == Index;
+		}
+
+		TestTrue(TEXT("Shifted grid maps to the adjacent targets"), bNeighbor);
+		TestEqual(TEXT("Shifted max move is the shift"), Stats.MaxMove, 5.0, 1.e-6);
+		TestEqual(TEXT("Shifted has no long moves"), Stats.LongMoves, 0);
+	}
+
+	TestFalse(TEXT("Count mismatch is rejected"),
+		FSwarmTargetAssigner::Assign(TArray<FVector>{FVector::ZeroVector}, Grid, Settings, Assignment));
+	TestEqual(TEXT("Rejected assign returns empty"), Assignment.Num(), 0);
+	TestTrue(TEXT("Empty input succeeds"), FSwarmTargetAssigner::Assign({}, {}, Settings, Assignment));
+
+	// 무작위 입력도 같은 입력이면 같은 결과이고, 모든 목표를 정확히 한 번 쓴다.
+	FRandomStream Random(7);
+	TArray<FVector> RandomStarts;
+	TArray<FVector> RandomTargets;
+
+	for (int32 Index = 0; Index < 300; ++Index)
+	{
+		RandomStarts.Add(Random.GetUnitVector() * Random.FRandRange(0.0, 200.0));
+		RandomTargets.Add(Random.GetUnitVector() * Random.FRandRange(0.0, 150.0));
+	}
+
+	TArray<int32> First;
+	TArray<int32> Second;
+	FSwarmTargetAssigner::Assign(RandomStarts, RandomTargets, Settings, First);
+	FSwarmTargetAssigner::Assign(RandomStarts, RandomTargets, Settings, Second);
+	TestTrue(TEXT("Same input gives the same assignment"), First == Second);
+
+	TArray<int32> Sorted = First;
+	Sorted.Sort();
+	bool bPermutation = Sorted.Num() == RandomTargets.Num();
+
+	for (int32 Index = 0; bPermutation && Index < Sorted.Num(); ++Index)
+	{
+		bPermutation = Sorted[Index] == Index;
+	}
+
+	TestTrue(TEXT("Every target is used exactly once"), bPermutation);
+
+	// 한 줄로 늘어선 목표 10개와, 한 칸씩 오른쪽으로 밀린 시작 위치 10개. 그리디는 9개를 제자리(이동 0)로 확정하고
+	// 마지막 시작 위치(x = 220)는 후보 2개를 모두 뺏겨 남은 목표(x = 0)로 220cm를 간다. 2차 작업(도미노)이 고칠 경우다.
+	TArray<FVector> LineTargets;
+	TArray<FVector> LineStarts;
+
+	for (int32 Index = 0; Index < 10; ++Index)
+	{
+		LineTargets.Add(FVector(Index * Spacing, 0.0, 0.0));
+		LineStarts.Add(FVector((Index + 1) * Spacing, 0.0, 0.0));
+	}
+
+	FSwarmAssignSettings TwoCandidates = Settings;
+	TwoCandidates.CandidateCount = 2;
+
+	if (TestTrue(TEXT("Line assign succeeds"), FSwarmTargetAssigner::Assign(LineStarts, LineTargets, TwoCandidates, Assignment, &Stats)))
+	{
+		TestEqual(TEXT("Last start falls back to the leftover target"), Assignment[9], 0);
+		TestEqual(TEXT("One leftover"), Stats.Leftovers, 1);
+		TestEqual(TEXT("One long move"), Stats.LongMoves, 1);
+		TestEqual(TEXT("Leftover moves across the line"), Stats.MaxMove, 10.0 * Spacing, 1.e-6);
+	}
+
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FSwarmAutoRebalanceTest, "SwarmBoss.Stage2.AutoRebalance",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+// 손실 자동 재분배를 검증한다. 피해 구간이 열려 있으면 미루고, 닫힌 다음 Tick에 한 번 재분배한다.
+// 구간 없이 지우면 다음 Tick에 바로 재분배하며, 자동을 끄면 재분배하지 않는다. 가까운 목표 배정이므로 평균 이동이 작다.
+bool FSwarmAutoRebalanceTest::RunTest(const FString& Parameters)
+{
+	UWorld* World = UWorld::CreateWorld(EWorldType::Game, false);
+
+	if (!TestNotNull(TEXT("Transient world"), World))
+	{
+		return false;
+	}
+
+	ASwarmBossManager* Boss = SpawnTwoPartManager(World, /*bAutoRebalanceOnLoss=*/true);
+
+	if (!TestNotNull(TEXT("Manager"), Boss) || !TestTrue(TEXT("Generate"), Boss->GenerateInitialParts()))
+	{
+		World->DestroyWorld(false);
+		return false;
+	}
+
+	UInstancedStaticMeshComponent* Torso = Boss->GetPartInstances(ESwarmPartId::Torso);
+	UInstancedStaticMeshComponent* Arm = Boss->GetPartInstances(ESwarmPartId::LeftArm);
+	const float Duration = Boss->ReconstructionDuration;
+	TestTrue(TEXT("Auto rebalance is on by default"), GetDefault<ASwarmBossManager>()->bAutoRebalanceOnLoss);
+	TestFalse(TEXT("Nothing pending after generation"), Boss->IsRebalancePending());
+
+	// 부위 구체들의 (목표 - 현재) 평균 거리. 재분배 직후에 재면 이번 배정의 평균 이동 거리다.
+	auto AverageMove = [Boss](ESwarmPartId PartId)
+	{
+		double Sum = 0.0;
+		int32 Count = 0;
+
+		for (const FSwarmParticle& Particle : Boss->GetParticles())
+		{
+			if (Particle.bActive && Particle.PartId == PartId)
+			{
+				Sum += FVector::Dist(Particle.LocalPosition, Particle.TargetLocalPosition);
+				++Count;
+			}
+		}
+
+		return Count > 0 ? Sum / Count : 0.0;
+	};
+
+	// 피해 구간이 열려 있는 동안 지운 구체는 구간이 닫힐 때까지 재분배하지 않는다.
+	Boss->BeginDamageWindow();
+
+	for (int32 Index = 0; Index < 9; ++Index)
+	{
+		Boss->RemoveInstance(Arm, 0);
+	}
+
+	TestTrue(TEXT("Loss marks rebalance pending"), Boss->IsRebalancePending());
+	TestTrue(TEXT("Loss enables Tick"), Boss->IsActorTickEnabled());
+	Boss->Tick(0.01f);
+	TestTrue(TEXT("Open window defers rebalance"), Boss->IsRebalancePending());
+	TestEqual(TEXT("Arm keeps its reduced count while deferred"), Arm->GetInstanceCount(), 21);
+
+	Boss->EndDamageWindow();
+	Boss->Tick(0.0f);
+	TestFalse(TEXT("Closing the window rebalances on the next Tick"), Boss->IsRebalancePending());
+	TestEqual(TEXT("Torso sends six"), Torso->GetInstanceCount(), 54);
+	TestEqual(TEXT("Arm receives six"), Arm->GetInstanceCount(), 27);
+
+	const double TorsoAverageMove = AverageMove(ESwarmPartId::Torso);
+	AddInfo(FString::Printf(TEXT("Torso average move after arm loss: %.1f cm"), TorsoAverageMove));
+	// 몸통은 60 → 54개로 다시 샘플링되어 점 배치가 통째로 바뀐다. 배열 순서로 배정하면 평균 이동이 몸통 크기 수준이지만,
+	// 가까운 목표끼리 짝지으면 구체 간격(22cm) 근처에 머문다. 여유를 두고 간격의 2배를 상한으로 본다.
+	TestTrue(TEXT("Nearest assignment keeps torso moves short"), TorsoAverageMove < 44.0);
+
+	Boss->Tick(Duration);
+	TestFalse(TEXT("Movement finishes and Tick turns off"), Boss->IsActorTickEnabled());
+
+	// 피해 구간 없이 지우면 다음 Tick에 바로 재분배한다.
+	Boss->RemoveInstance(Torso, 0);
+	Boss->Tick(0.0f);
+	TestFalse(TEXT("Loss without a window rebalances on the next Tick"), Boss->IsRebalancePending());
+	TestEqual(TEXT("Remainder stays on torso"), Torso->GetInstanceCount(), 54);
+	TestEqual(TEXT("Arm gives one back"), Arm->GetInstanceCount(), 26);
+	Boss->Tick(Duration);
+
+	// 자동 재분배를 끄면 손실만 반영한다.
+	Boss->SetAutoRebalanceOnLoss(false);
+	Boss->RemoveInstance(Arm, 0);
+	TestFalse(TEXT("Disabled auto rebalance does not mark pending"), Boss->IsRebalancePending());
+	Boss->Tick(Duration);
+	TestEqual(TEXT("Disabled auto rebalance keeps torso"), Torso->GetInstanceCount(), 54);
+	TestEqual(TEXT("Disabled auto rebalance keeps arm"), Arm->GetInstanceCount(), 25);
+
+	World->DestroyWorld(false);
+	return true;
+}
+
 #endif
-
-

@@ -107,6 +107,13 @@ bool ASwarmProjectile::Advance(float DeltaTime)
 
 	for (TPair<ASwarmBossManager*, TArray<FHitResult>>& Pair : SwarmHits)
 	{
+		// 이 보스를 처음 맞혔으면 제거 전에 피해 구간을 열어, 이번 통과에서 지우는 구체를 모두 한 번의 재분배로 묶는다.
+		if (!OpenWindowBosses.Contains(Pair.Key))
+		{
+			Pair.Key->BeginDamageWindow();
+			OpenWindowBosses.Add(Pair.Key);
+		}
+
 		const int32 RemovedCount = Pair.Key->RemoveHitInstances(Pair.Value);
 		TotalRemovedCount += RemovedCount;
 
@@ -119,11 +126,61 @@ bool ASwarmProjectile::Advance(float DeltaTime)
 
 	if (WallHit)
 	{
+		// Destroy()가 Destroyed()·EndPlay()를 거쳐 열린 피해 구간을 모두 닫는다.
 		SetActorLocation(WallHit->Location);
 		Destroy();
 		return true;
 	}
 
 	SetActorLocation(End);
+
+	// 이번 구간에서 맞히지 않았고 투사체 구가 보스 경계 상자와 겹치지 않으면 통과가 끝난 것으로 보고 구간을 닫는다.
+	// 경계 상자 안의 빈틈(관절 Gap 등)에서는 닫지 않는다. 맞힌 프레임에 닫지 않는 이유는, 직전 재분배로 아직
+	// 이동 중인 구체가 상자 밖에 잠깐 있을 수 있어 그 구체를 맞히는 동안 구간이 열리고 닫히길 반복하지 않게 하기 위해서다.
+	for (int32 Index = OpenWindowBosses.Num() - 1; Index >= 0; --Index)
+	{
+		ASwarmBossManager* Boss = OpenWindowBosses[Index].Get();
+
+		if (!Boss)
+		{
+			OpenWindowBosses.RemoveAt(Index);
+			continue;
+		}
+
+		if (!SwarmHits.Contains(Boss) && !Boss->GetSwarmBounds().ExpandBy(Radius).IsInside(End))
+		{
+			Boss->EndDamageWindow();
+			OpenWindowBosses.RemoveAt(Index);
+		}
+	}
+
 	return false;
+}
+
+// 벽·바닥 충돌, 수명 종료, 레벨 종료 등 어떤 이유로 사라지든 아직 닫지 않은 피해 구간을 모두 닫는다.
+// 닫지 않으면 그 보스의 열린 구간 수가 0으로 돌아오지 않아 손실 재분배가 영영 일어나지 않는다.
+// 파괴는 Destroyed(), 레벨 언로드 등은 EndPlay()로 오므로 둘 다에서 닫는다. BeginPlay 전의 Actor는 EndPlay가 불리지 않는다.
+void ASwarmProjectile::CloseAllDamageWindows()
+{
+	for (const TWeakObjectPtr<ASwarmBossManager>& Boss : OpenWindowBosses)
+	{
+		if (Boss.IsValid())
+		{
+			Boss->EndDamageWindow();
+		}
+	}
+
+	OpenWindowBosses.Reset();
+}
+
+void ASwarmProjectile::Destroyed()
+{
+	CloseAllDamageWindows();
+	Super::Destroyed();
+}
+
+void ASwarmProjectile::EndPlay(const EEndPlayReason::Type EndPlayReason)
+{
+	CloseAllDamageWindows();
+	Super::EndPlay(EndPlayReason);
 }

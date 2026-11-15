@@ -81,6 +81,26 @@ public:
 	// 중앙 Particles 배열 순서대로 지정 부위의 활성 구체를 최대 MaxCount개 선택해 ParticleId 목록을 반환한다.
 	TArray<int32> SelectPartParticleIds(ESwarmPartId PartId, int32 MaxCount) const;
 
+	// 여러 프레임에 걸쳐 구체를 지우는 피해(관통 투사체 등)가 시작·끝날 때 호출한다. 열린 구간이 하나라도 있으면
+	// 손실 자동 재분배를 미루고, 모두 닫힌 다음 Tick에 모인 손실을 한 번에 재분배한다. Begin마다 End를 정확히 한 번 호출해야 한다.
+	void BeginDamageWindow();
+	void EndDamageWindow();
+	int32 GetOpenDamageWindowCount() const { return OpenDamageWindowCount; }
+
+	// 손실로 자동 재분배를 기다리는 중이면 true.
+	bool IsRebalancePending() const { return bRebalancePending; }
+
+	// 손실 자동 재분배를 켜거나 끈다. 끄면 이미 기다리던 재분배도 취소한다.
+	void SetAutoRebalanceOnLoss(bool bEnabled)
+	{
+		bAutoRebalanceOnLoss = bEnabled;
+		bRebalancePending &= bEnabled;
+	}
+
+	// 모든 부위의 현재 도형(반크기 + 구체 반지름)을 감싸는 월드 AABB. 구체가 없으면 유효하지 않은 상자를 반환한다.
+	// 피해 구간을 연 투사체가 보스를 벗어났는지 판단할 때 쓴다. 구체를 하나씩 보지 않으므로 부위 수만큼만 계산한다.
+	FBox GetSwarmBounds() const;
+
 	virtual void Tick(float DeltaTime) override;
 
 protected:
@@ -89,6 +109,7 @@ protected:
 private:
 	friend class FSwarmManagerBehaviorTest;
 	friend class FSwarmNeighborTransferTest;
+	friend class FSwarmAutoRebalanceTest;
 
 	// 재구성 목표를 배정한 시점부터 도착까지의 게임 시간(초). 변경한 값은 다음 목표 배정부터 적용한다.
 	UPROPERTY(EditAnywhere, Category="Swarm|Movement", meta=(ClampMin="0.01", UIMin="0.01", Units="s"))
@@ -123,6 +144,23 @@ private:
 	// 너무 크면 샘플링이 실패하거나 도형이 확장된다. 다음 GenerateInitialParts()부터 적용하며, 재분배는 생성 때 값을 유지한다.
 	UPROPERTY(EditAnywhere, Category="Swarm|Generation", meta=(ClampMin="0.05", ClampMax="0.7"))
 	float PackingCoefficient = 0.5f;
+
+	// 구체를 잃으면(RemoveInstance 성공) 다음 Tick에 RebalancePartsFromDefinition()을 자동으로 호출한다.
+	// 피해 구간이 열려 있으면 모두 닫힐 때까지 미룬다. 끄면 T 입력 등으로 직접 호출할 때만 재분배한다.
+	UPROPERTY(EditAnywhere, Category="Swarm|Rebalance")
+	bool bAutoRebalanceOnLoss = true;
+
+	// 재분배 목표 배정에서 구체마다 살펴볼 가까운 목표 후보 수 k.
+	UPROPERTY(EditAnywhere, Category="Swarm|Rebalance", meta=(ClampMin="1", ClampMax="64"))
+	int32 AssignCandidateCount = 12;
+
+	// 먼 이동 기준 = 구체 중심 최소 간격 d × 이 값. 지금은 배정 로그의 LongMoves 통계에만 쓴다.
+	UPROPERTY(EditAnywhere, Category="Swarm|Rebalance", meta=(ClampMin="0.5", ClampMax="10"))
+	float LongMoveThresholdScale = 2.0f;
+
+	// 손실 후 아직 재분배하지 않았으면 true. 열린 피해 구간 수가 0이 된 뒤 Tick에서 처리하고 지운다.
+	bool bRebalancePending = false;
+	int32 OpenDamageWindowCount = 0;
 
 	FSwarmParticleStore ParticleStore;
 

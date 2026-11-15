@@ -4,6 +4,7 @@
 #include "GameFramework/Actor.h"
 #include "SwarmProjectile.generated.h"
 
+class ASwarmBossManager;
 class UStaticMeshComponent;
 
 /**
@@ -11,6 +12,8 @@ class UStaticMeshComponent;
  * 충돌 컴포넌트 없이 매 Tick 이번 이동 구간을 같은 반지름의 구로 Sweep 조회(SweepMultiByObjectType)하고,
  * 닿은 군체 구체(SwarmSphere)를 모두 제거한 채 멈추지 않고 계속 날아간다(관통 한도 없음).
  * 벽 등 WorldStatic·WorldDynamic에 닿으면 그 앞까지의 구체만 제거하고 사라진다.
+ * 보스를 처음 맞히면 그 Manager의 피해 구간을 열고, 보스 경계 상자를 벗어나거나 투사체가 사라질 때 닫는다.
+ * 그래서 한 발이 여러 프레임에 걸쳐 지운 구체는 한 번의 재분배로 묶인다.
  */
 UCLASS()
 class SWARMBOSS_API ASwarmProjectile : public AActor
@@ -28,6 +31,8 @@ public:
 	bool Advance(float DeltaTime);
 
 	virtual void Tick(float DeltaTime) override;
+	virtual void EndPlay(const EEndPlayReason::Type EndPlayReason) override;
+	virtual void Destroyed() override;
 
 	// 발사 후 지금까지 제거한 구체 수의 합계.
 	int32 GetTotalRemovedCount() const { return TotalRemovedCount; }
@@ -39,4 +44,10 @@ private:
 	FVector Velocity = FVector::ZeroVector;
 	float Radius = 0.0f;
 	int32 TotalRemovedCount = 0;
+
+	// 이 투사체가 피해 구간을 열어 둔 Manager 목록. 보스가 먼저 사라질 수 있으므로 약한 참조로 둔다.
+	TArray<TWeakObjectPtr<ASwarmBossManager>> OpenWindowBosses;
+
+	// 아직 열려 있는 피해 구간을 모두 닫는다. 두 번 호출해도 한 번만 닫는다.
+	void CloseAllDamageWindows();
 };
