@@ -97,6 +97,9 @@ class SWARMBOSS_API FSwarmShapeSampler
 public:
 	static FSwarmSamplingResult GenerateTargets(const FSwarmSamplingSettings& Settings);
 	static bool Contains(const FVector& Point, ESwarmPrimitive Shape, const FVector& HalfExtents);
+
+	// Point에서 가장 가까운 도형 안의 점. 안에 있으면 그대로, 밖이면 박스는 축마다 범위로 자르고 구는 반지름으로 자른다.
+	static FVector ClampInside(const FVector& Point, ESwarmPrimitive Shape, const FVector& HalfExtents);
 	static bool ValidateTargets(const TArray<FVector>& Points, ESwarmPrimitive Shape,
 		const FVector& HalfExtents, double MinimumDistance, double& OutMeasuredMinimum);
 };

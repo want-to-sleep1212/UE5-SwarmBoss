@@ -1588,6 +1588,11 @@ bool FSwarmPartPlacementTest::RunTest(const FString& Parameters)
 		bool bHandParticlesStayed = true;
 		bool bHandInstancesMatch = true;
 
+		// 관절 재배치는 중앙 좌표만 고치고 인스턴스는 다음 이동 갱신에서 쓴다. 시간 0으로 한 번 갱신해 인스턴스를 맞춘 뒤 비교한다.
+		// 이 테스트의 앞선 제거로 남은 자동 재분배 대기가 Tick에서 실행되지 않도록 자동 재분배는 끈다.
+		Boss->SetAutoRebalanceOnLoss(false);
+		Boss->Tick(0.0f);
+
 		for (const TPair<int32, FVector>& Pair : HandWorldPositions)
 		{
 			const FSwarmParticle& Particle = Boss->GetParticles()[Pair.Key];
@@ -2162,7 +2167,8 @@ bool FSwarmTargetAssignerTest::RunTest(const FString& Parameters)
 	TestTrue(TEXT("Every target is used exactly once"), bPermutation);
 
 	// 한 줄로 늘어선 목표 10개와, 한 칸씩 오른쪽으로 밀린 시작 위치 10개. 그리디는 9개를 제자리(이동 0)로 확정하고
-	// 마지막 시작 위치(x = 220)는 후보 2개를 모두 뺏겨 남은 목표(x = 0)로 220cm를 간다. 2차 작업(도미노)이 고칠 경우다.
+	// 마지막 시작 위치(x = 220)는 후보 2개를 모두 뺏겨 남은 목표(x = 0)로 220cm를 간다.
+	// 도미노는 이를 "모든 구체가 한 칸(22cm)씩 왼쪽으로" 바꾼다.
 	TArray<FVector> LineTargets;
 	TArray<FVector> LineStarts;
 
@@ -2172,15 +2178,97 @@ bool FSwarmTargetAssignerTest::RunTest(const FString& Parameters)
 		LineStarts.Add(FVector((Index + 1) * Spacing, 0.0, 0.0));
 	}
 
-	FSwarmAssignSettings TwoCandidates = Settings;
-	TwoCandidates.CandidateCount = 2;
+	FSwarmAssignSettings GreedyOnly = Settings;
+	GreedyOnly.CandidateCount = 2;
+	GreedyOnly.MaxLongMoveRepairs = 0;
 
-	if (TestTrue(TEXT("Line assign succeeds"), FSwarmTargetAssigner::Assign(LineStarts, LineTargets, TwoCandidates, Assignment, &Stats)))
+	if (TestTrue(TEXT("Greedy line assign succeeds"), FSwarmTargetAssigner::Assign(LineStarts, LineTargets, GreedyOnly, Assignment, &Stats)))
 	{
 		TestEqual(TEXT("Last start falls back to the leftover target"), Assignment[9], 0);
 		TestEqual(TEXT("One leftover"), Stats.Leftovers, 1);
 		TestEqual(TEXT("One long move"), Stats.LongMoves, 1);
+		TestEqual(TEXT("Nothing repaired without repairs"), Stats.Repaired, 0);
 		TestEqual(TEXT("Leftover moves across the line"), Stats.MaxMove, 10.0 * Spacing, 1.e-6);
+	}
+
+	// 기준을 1.5칸으로 두면 한 칸 이동만 허용되어 사슬이 하나로 정해진다(기준 2칸이면 두 칸씩 건너뛰는 더 짧은 사슬이 나온다).
+	FSwarmAssignSettings WithRepair = GreedyOnly;
+	WithRepair.MaxLongMoveRepairs = 50;
+	WithRepair.LongMoveThreshold = 1.5 * Spacing;
+
+	if (TestTrue(TEXT("Repaired line assign succeeds"), FSwarmTargetAssigner::Assign(LineStarts, LineTargets, WithRepair, Assignment, &Stats)))
+	{
+		bool bShiftedByOne = true;
+
+		for (int32 Index = 0; Index < 10; ++Index)
+		{
+			bShiftedByOne &= Assignment[Index] == Index;
+		}
+
+		TestTrue(TEXT("Domino shifts every start one slot"), bShiftedByOne);
+		TestEqual(TEXT("Greedy long move is counted"), Stats.GreedyLongMoves, 1);
+		TestEqual(TEXT("One repair"), Stats.Repaired, 1);
+		TestEqual(TEXT("No long move remains"), Stats.LongMoves, 0);
+		TestEqual(TEXT("Every move is one slot"), Stats.MaxMove, Spacing, 1.e-6);
+	}
+
+	// 기준 이내로 갈 수 있는 목표가 없으면 고칠 수 없어 그리디 결과를 그대로 둔다.
+	const TArray<FVector> FarStarts{FVector(0.0), FVector(500.0, 0.0, 0.0)};
+	const TArray<FVector> FarTargets{FVector(0.0), FVector(1000.0, 0.0, 0.0)};
+
+	if (TestTrue(TEXT("Unrepairable assign succeeds"), FSwarmTargetAssigner::Assign(FarStarts, FarTargets, Settings, Assignment, &Stats)))
+	{
+		TestTrue(TEXT("Unrepairable keeps the greedy result"), Assignment[0] == 0 && Assignment[1] == 1);
+		TestEqual(TEXT("Unrepairable long move stays"), Stats.LongMoves, 1);
+		TestEqual(TEXT("Unrepairable is not counted as repaired"), Stats.Repaired, 0);
+	}
+
+	// 6×6×6 격자 가운데 줄(y = z = 2)의 구체 6개가 빠진 터널이 있고, 같은 수의 구체가 x = 5 면 바로 바깥(x = 6) 한 칸에 있다.
+	// 바깥 구체의 가까운 목표는 이미 격자 구체가 차지해, 그리디는 이들을 터널 안 빈 목표로 멀리 보낸다.
+	// 도미노는 바깥 구체가 면으로 한 칸 들어오고 격자 구체들이 터널 쪽으로 한 칸씩 밀리는 사슬로 바꿔야 한다.
+	TArray<FVector> TunnelTargets;
+	TArray<FVector> TunnelStarts;
+
+	for (int32 X = 0; X < 6; ++X)
+	{
+		for (int32 Y = 0; Y < 6; ++Y)
+		{
+			for (int32 Z = 0; Z < 6; ++Z)
+			{
+				const FVector Point = FVector(X, Y, Z) * Spacing;
+				TunnelTargets.Add(Point);
+
+				if (Y != 2 || Z != 2)
+				{
+					TunnelStarts.Add(Point);
+				}
+			}
+		}
+	}
+
+	for (const FIntPoint& Face : {FIntPoint(2, 2), FIntPoint(1, 2), FIntPoint(3, 2), FIntPoint(2, 1), FIntPoint(2, 3), FIntPoint(1, 1)})
+	{
+		TunnelStarts.Add(FVector(6, Face.X, Face.Y) * Spacing);
+	}
+
+	if (TestTrue(TEXT("Tunnel assign succeeds"), FSwarmTargetAssigner::Assign(TunnelStarts, TunnelTargets, Settings, Assignment, &Stats)))
+	{
+		AddInfo(FString::Printf(TEXT("Tunnel: Greedy long=%d Repaired=%d Final long=%d MaxMove=%.1f"),
+			Stats.GreedyLongMoves, Stats.Repaired, Stats.LongMoves, Stats.MaxMove));
+		TestTrue(TEXT("Tunnel has greedy long moves"), Stats.GreedyLongMoves > 0);
+		TestEqual(TEXT("Domino removes every tunnel long move"), Stats.LongMoves, 0);
+		TestTrue(TEXT("Tunnel max move is within the threshold"), Stats.MaxMove <= Settings.LongMoveThreshold + 1.e-6);
+
+		TArray<int32> TunnelSorted = Assignment;
+		TunnelSorted.Sort();
+		bool bTunnelPermutation = true;
+
+		for (int32 Index = 0; Index < TunnelSorted.Num(); ++Index)
+		{
+			bTunnelPermutation &= TunnelSorted[Index] == Index;
+		}
+
+		TestTrue(TEXT("Tunnel repair keeps every target used once"), bTunnelPermutation);
 	}
 
 	return true;
@@ -2276,6 +2364,15 @@ bool FSwarmAutoRebalanceTest::RunTest(const FString& Parameters)
 	Boss->Tick(Duration);
 	TestEqual(TEXT("Disabled auto rebalance keeps torso"), Torso->GetInstanceCount(), 54);
 	TestEqual(TEXT("Disabled auto rebalance keeps arm"), Arm->GetInstanceCount(), 25);
+
+	// 들어온 구체의 출발점은 현재 위치를 받는 부위 도형 안으로 붙인 점이다. 박스는 축마다, 구는 반지름으로 자르고 안은 그대로.
+	const FVector Box(50.0, 30.0, 80.0);
+	TestTrue(TEXT("Inside point is kept"), FSwarmShapeSampler::ClampInside(FVector(10.0, -5.0, 20.0),
+		ESwarmPrimitive::Box, Box).Equals(FVector(10.0, -5.0, 20.0)));
+	TestTrue(TEXT("Box clamps each axis"), FSwarmShapeSampler::ClampInside(FVector(120.0, -5.0, -200.0),
+		ESwarmPrimitive::Box, Box).Equals(FVector(50.0, -5.0, -80.0)));
+	TestTrue(TEXT("Sphere clamps to its radius"), FSwarmShapeSampler::ClampInside(FVector(0.0, 300.0, 400.0),
+		ESwarmPrimitive::Sphere, FVector(50.0)).Equals(FVector(0.0, 30.0, 40.0), 1.e-6));
 
 	World->DestroyWorld(false);
 	return true;

@@ -7,6 +7,8 @@
 #include "Boss/SwarmTransferPlanner.h"
 #include "Swarm/SwarmShapeSampler.h"
 #include "Swarm/SwarmTargetAssigner.h"
+#include "HAL/PlatformTime.h"
+#include "ProfilingDebugging/CpuProfilerTrace.h"
 #include "UObject/ConstructorHelpers.h"
 
 DEFINE_LOG_CATEGORY_STATIC(LogSwarmBossManager, Log, All);
@@ -237,8 +239,14 @@ void ASwarmBossManager::SyncPartInstances(const USwarmFormDefinition& Definition
 // 위치는 Parts의 현재 HalfExtents·구체 반지름과 생성 당시 부위 정의의 연결점·Gap으로 계산하므로, 도형 크기가 바뀐 뒤 호출하면 관절이 표면을 따라간다.
 // bPreserveParticleWorldPositions가 true이면 ISM이 움직인 부위의 활성 구체를 같은 월드 위치에 남기도록 로컬 좌표를 다시 계산하고,
 // 기존 로컬 목표로 ReconstructionDuration초 동안 다시 이동시킨다. 초기 생성처럼 구체 좌표가 새 배치 기준이면 false로 호출한다.
+// 이때 ISM 인스턴스는 직접 고치지 않고 중앙 데이터의 좌표만 바꾼다. 다시 이동하는 구체는 같은 Tick의 UpdateParticleMovement()가
+// 새 좌표로 인스턴스를 쓰므로, 여기서도 쓰면 한 프레임에 같은 인스턴스를 두 번 쓰게 된다(인스턴스마다 렌더·충돌 바디 갱신 비용이
+// 있어 구체 2000개에서 약 26ms, 2026-11-16 측정). 새 좌표가 곧 목표라 움직이지 않을 구체만 여기서 인스턴스를 쓴다.
+// 자동 재분배는 Manager Tick 안에서 이동 갱신 직전에 실행되므로 화면이 어긋나지 않는다. T 입력처럼 Tick 밖에서 호출하면
+// 그 프레임에 Manager Tick이 이미 지났을 경우 한 프레임 동안 부위 이동량만큼 어긋나 보일 수 있다.
 void ASwarmBossManager::ApplyPartPlacement(bool bPreserveParticleWorldPositions)
 {
+	TRACE_CPUPROFILER_EVENT_SCOPE(Swarm_ApplyPlacement);
 	TMap<ESwarmPartId, FTransform> OldWorldTransforms;
 
 	if (bPreserveParticleWorldPositions)
@@ -325,24 +333,30 @@ void ASwarmBossManager::ApplyPartPlacement(bool bPreserveParticleWorldPositions)
 		// 이전 ISM 기준 로컬 → 월드 → 새 ISM 기준 로컬로 바꿔 화면 위치를 유지한다.
 		const FVector NewLocalPosition = NewTransform.InverseTransformPosition(
 			OldTransform->TransformPosition(Particle.LocalPosition));
-		FTransform InstanceTransform;
 
-		if (!Instances->GetInstanceTransform(Particle.InstanceIndex, InstanceTransform, /*bWorldSpace=*/false))
+		// 새 좌표가 곧 목표면 이동 갱신이 이 구체를 건너뛰므로 여기서 인스턴스를 직접 쓴다(드묾).
+		if (NewLocalPosition == Particle.TargetLocalPosition)
 		{
-			continue;
-		}
+			FTransform InstanceTransform;
 
-		InstanceTransform.SetLocation(NewLocalPosition);
+			if (!Instances->GetInstanceTransform(Particle.InstanceIndex, InstanceTransform, /*bWorldSpace=*/false))
+			{
+				continue;
+			}
 
-		if (!Instances->UpdateInstanceTransform(Particle.InstanceIndex, InstanceTransform,
-			/*bWorldSpace=*/false, /*bMarkRenderStateDirty=*/false, /*bTeleport=*/true))
-		{
-			continue;
+			InstanceTransform.SetLocation(NewLocalPosition);
+
+			if (!Instances->UpdateInstanceTransform(Particle.InstanceIndex, InstanceTransform,
+				/*bWorldSpace=*/false, /*bMarkRenderStateDirty=*/false, /*bTeleport=*/true))
+			{
+				continue;
+			}
+
+			ChangedInstances.AddUnique(Instances);
 		}
 
 		ParticleStore.UpdateMovementProgress(ParticleId, NewLocalPosition, Particle.RemainingMoveTime);
 		AssignParticleTarget(ParticleId, Particle.TargetLocalPosition, ReconstructionDuration);
-		ChangedInstances.AddUnique(Instances);
 	}
 
 	for (UInstancedStaticMeshComponent* Instances : ChangedInstances)
@@ -815,6 +829,7 @@ FSwarmPart* ASwarmBossManager::FindPartByComponent(const UPrimitiveComponent* Hi
 // 다른 Actor·컴포넌트의 결과, 잘못된 인스턴스 번호, 같은 구체의 중복 결과는 건너뛴다.
 int32 ASwarmBossManager::RemoveHitInstances(TConstArrayView<FHitResult> Hits)
 {
+	TRACE_CPUPROFILER_EVENT_SCOPE(Swarm_RemoveHits);
 	TArray<int32> HitParticleIds;
 
 	for (const FHitResult& Hit : Hits)
@@ -888,7 +903,8 @@ bool ASwarmBossManager::RemoveInstance(const UPrimitiveComponent* HitComponent, 
 		ParticleStore.SetInstanceIndex(LastParticleId, InstanceIndex);
 	}
 
-	UE_LOG(LogSwarmBossManager, Display,
+	// 관통 한 발에 수십 번 불리므로 기본 출력에서는 숨긴다(Verbose). 에디터 로그에 수십 줄씩 쓰는 비용도 프레임 튐에 더해진다.
+	UE_LOG(LogSwarmBossManager, Verbose,
 		TEXT("Removed Instance=%d Remaining=%d"),
 		InstanceIndex,
 		GetActiveParticleCount());
@@ -954,6 +970,10 @@ bool ASwarmBossManager::TransferParticle(int32 ParticleId, ESwarmPartId Destinat
 	{
 		return false;
 	}
+
+	// 위치는 인스턴스가 아니라 중앙 데이터에서 읽는다. 재분배의 관절 재배치는 중앙 좌표만 고치고 인스턴스는 다음 이동 갱신에서
+	// 쓰므로, 같은 재분배 안에서 이어지는 전달 시점에는 인스턴스 위치가 아직 이전 값일 수 있다(회전·크기는 인스턴스 값을 쓴다).
+	WorldTransform.SetLocation(SourceInstances->GetComponentTransform().TransformPosition(Particle.LocalPosition));
 
 	const FTransform DestinationLocalTransform = WorldTransform.GetRelativeTransform(DestinationTransform);
 	const FVector DestinationLocalPosition = DestinationLocalTransform.GetLocation();
@@ -1082,12 +1102,24 @@ bool ASwarmBossManager::RebalanceParts(ESwarmPartId FirstPartId, ESwarmPartId Se
 //    보낼 부위가 가진 수보다 많이 넘겨야 하면, 그 부위로 들어오는 구체 일부가 길목을 건너뛰어 다음 부위로 바로 간다.
 //    보낼 구체는 첫 관절에 가장 가까운 것부터 고른다.
 // 4) 개수가 바뀌었거나 전달로 구체가 드나든 부위마다, 생존 구체 전체를 새 목표에 가까운 것끼리 짝지어(FSwarmTargetAssigner)
-//    ReconstructionDuration초 동안 이동시킨다. 원래 있던 구체는 현재 위치, 이번에 들어온 구체는 들어온 관절 위치에서 출발한다고 본다.
+//    ReconstructionDuration초 동안 이동시킨다. 원래 있던 구체는 현재 위치, 이번에 들어온 구체는 받는 부위 도형 표면의
+//    연결점에서 출발한다고 본다. 그리디 뒤 남은 먼 이동은 도미노로 기준 이내 사슬로 고친다(FSwarmTargetAssigner).
 //    개수가 그대로이고 드나든 구체도 없는 부위는 목표를 바꾸지 않는다.
 // 재구성 시간이 유효한 양수가 아니면 거부한다. 모든 부위가 이미 목표 개수이면 아무것도 바꾸지 않고 true를 반환한다.
 // 전달이 일부만 성공하면 성공한 변경은 유지하고 false를 반환한다.
 bool ASwarmBossManager::RebalanceToCounts(TConstArrayView<TPair<ESwarmPartId, int32>> PartTargetCounts)
 {
+	TRACE_CPUPROFILER_EVENT_SCOPE(Swarm_Rebalance);
+
+	// 단계별 소요 시간(ms). 성공하면 마지막에 한 줄로 남긴다. 프레임 튐의 원인을 찾기 위한 측정이다.
+	const double RebalanceStart = FPlatformTime::Seconds();
+	double SamplingMs = 0.0;
+	double PlacementMs = 0.0;
+	double TransferMs = 0.0;
+	double AssignMs = 0.0;
+	int32 ProcessedParts = 0;
+	auto MillisecondsSince = [](double Since) { return (FPlatformTime::Seconds() - Since) * 1000.0; };
+
 	if (!FMath::IsFinite(ReconstructionDuration) || ReconstructionDuration <= 0.0f || PartTargetCounts.Num() < 2)
 	{
 		return false;
@@ -1136,10 +1168,13 @@ bool ASwarmBossManager::RebalanceToCounts(TConstArrayView<TPair<ESwarmPartId, in
 	// Index 부위의 새 목표 좌표를 생성한다. 실패하면 경고를 남기고 false를 반환한다.
 	auto SamplePart = [&](int32 Index)
 	{
+		const double SampleStart = FPlatformTime::Seconds();
 		FSwarmSamplingSettings Settings = TargetParts[Index]->SamplingSettings;
 		Settings.ParticleCount = PartTargetCounts[Index].Value;
+		Settings.CandidatesPerPoint = RebalanceCandidatesPerPoint;
 		Results[Index] = FSwarmShapeSampler::GenerateTargets(Settings);
 		bSampled[Index] = Results[Index].bSuccess;
+		SamplingMs += MillisecondsSince(SampleStart);
 
 		if (!Results[Index].bSuccess)
 		{
@@ -1168,7 +1203,10 @@ bool ASwarmBossManager::RebalanceToCounts(TConstArrayView<TPair<ESwarmPartId, in
 		}
 	}
 
+	const double PlacementStart = FPlatformTime::Seconds();
 	ApplyPartPlacement(/*bPreserveParticleWorldPositions=*/true);
+	PlacementMs = MillisecondsSince(PlacementStart);
+	const double TransferStart = FPlatformTime::Seconds();
 
 	// 부위 트리 위에서 이웃 부위끼리만 넘기는 전달 계획을 만든다. 목록에 없는 부위는 개수를 바꾸지 않고 길목 역할만 한다.
 	TMap<ESwarmPartId, ESwarmPartId> Parents;
@@ -1198,9 +1236,8 @@ bool ASwarmBossManager::RebalanceToCounts(TConstArrayView<TPair<ESwarmPartId, in
 	// 묶음마다 출발 부위에서 첫 관절에 가장 가까운 구체를 골라 최종 부위로 보낸다. 모든 묶음은 동시에 출발한다.
 	// 이번 재분배에서 이미 옮긴 구체는 다시 고르지 않으므로, 들어온 구체가 곧바로 다른 곳으로 다시 나가지 않는다.
 	// 이동 목표는 바로 아래의 최종 배정에서 다시 정하므로 여기서는 소속만 바꾼다.
-	// 옮긴 구체마다 최종 부위로 들어가는 관절(경로의 마지막 관절)의 월드 위치를 기록해 배정의 출발점으로 쓴다.
+	// 옮긴 구체(MovedParticleIds)는 배정에서 출발점을 따로 계산한다.
 	TSet<int32> MovedParticleIds;
-	TMap<int32, FVector> EntryWorldLocations;
 	TSet<ESwarmPartId> TouchedPartIds;
 
 	for (const FSwarmTransferShipment& Shipment : Shipments)
@@ -1208,7 +1245,6 @@ bool ASwarmBossManager::RebalanceToCounts(TConstArrayView<TPair<ESwarmPartId, in
 		const ESwarmPartId SourcePartId = Shipment.Path[0];
 		const ESwarmPartId DestinationPartId = Shipment.Path.Last();
 		const FVector JointLocation = GetJointWorldLocation(SourcePartId, Shipment.Path[1]);
-		const FVector EntryLocation = GetJointWorldLocation(Shipment.Path[Shipment.Path.Num() - 2], DestinationPartId);
 		TouchedPartIds.Add(SourcePartId);
 		TouchedPartIds.Add(DestinationPartId);
 		const TArray<int32> ParticleIds =
@@ -1220,7 +1256,6 @@ bool ASwarmBossManager::RebalanceToCounts(TConstArrayView<TPair<ESwarmPartId, in
 			if (TransferParticle(ParticleId, DestinationPartId))
 			{
 				MovedParticleIds.Add(ParticleId);
-				EntryWorldLocations.Add(ParticleId, EntryLocation);
 				++TransferredCount;
 			}
 		}
@@ -1240,6 +1275,8 @@ bool ASwarmBossManager::RebalanceToCounts(TConstArrayView<TPair<ESwarmPartId, in
 			return false;
 		}
 	}
+
+	TransferMs = MillisecondsSince(TransferStart);
 
 	// 전달한 구체뿐 아니라 부위의 생존 구체 전체를 새 목표와 1:1로 짝지어 최종 배치가 겹치지 않게 한다.
 	// 가까운 목표끼리 짝지으므로 맞은 곳에서 먼 구체는 거의 움직이지 않고, 빈자리 주변 구체가 조금씩 메운다.
@@ -1262,6 +1299,8 @@ bool ASwarmBossManager::RebalanceToCounts(TConstArrayView<TPair<ESwarmPartId, in
 			}
 		}
 
+		const double AssignStart = FPlatformTime::Seconds();
+		++ProcessedParts;
 		const int32 TargetCount = PartTargetCounts[Index].Value;
 		const TArray<int32> ParticleIds = SelectPartParticleIds(PartId, TargetCount);
 
@@ -1270,17 +1309,22 @@ bool ASwarmBossManager::RebalanceToCounts(TConstArrayView<TPair<ESwarmPartId, in
 			return false;
 		}
 
-		// 배정의 출발점은 부위 로컬 좌표다. 이번에 들어온 구체는 관절 위치, 나머지는 현재 위치(이동 중이면 지금 있는 곳).
-		const FTransform PartTransform = TargetParts[Index]->Instances->GetComponentTransform();
+		// 배정의 출발점은 부위 로컬 좌표다. 원래 있던 구체는 현재 위치(이동 중이면 지금 있는 곳), 이번에 들어온 구체는
+		// 현재 위치(아직 보낸 부위 쪽, 관절 근처)를 이 부위 도형 안으로 붙인 점이다. 보낸 구체는 관절 근처에 퍼져 있으므로
+		// 출발점도 연결 면 위에 조각 모양으로 퍼진다.
+		// - 관절(Gap 가운데)을 쓰면 Gap이 클 때 출발점 근처에 목표가 없어 도미노가 사슬을 시작하지 못했다(100~400cm 이동).
+		// - 연결점 한 점을 쓰면 한 번에 많이 받을 때(20~30개) 모두 같은 점에서 출발해, 그 근처 목표 몇 개를 차지한 뒤
+		//   사슬이 바깥으로 뻗지 못하고 막혔다(Play: 왼다리 26개 유입 시 LongMoves=17).
 		const TArray<FSwarmParticle>& Particles = ParticleStore.GetParticles();
+		const FSwarmPart& Part = *TargetParts[Index];
 		TArray<FVector> Starts;
 		Starts.Reserve(TargetCount);
 
 		for (int32 ParticleId : ParticleIds)
 		{
-			const FVector* EntryWorldLocation = EntryWorldLocations.Find(ParticleId);
-			Starts.Add(EntryWorldLocation ? PartTransform.InverseTransformPosition(*EntryWorldLocation)
-				: Particles[ParticleId].LocalPosition);
+			const FVector& Position = Particles[ParticleId].LocalPosition;
+			Starts.Add(MovedParticleIds.Contains(ParticleId)
+				? FSwarmShapeSampler::ClampInside(Position, Part.Definition.Shape, Part.HalfExtents) : Position);
 		}
 
 		const FSwarmSamplingSettings& Sampling = TargetParts[Index]->SamplingSettings;
@@ -1288,6 +1332,7 @@ bool ASwarmBossManager::RebalanceToCounts(TConstArrayView<TPair<ESwarmPartId, in
 		AssignSettings.CandidateCount = AssignCandidateCount;
 		AssignSettings.CellSize = 2.0 * Sampling.ParticleRadius + Sampling.SpacingMargin;
 		AssignSettings.LongMoveThreshold = AssignSettings.CellSize * LongMoveThresholdScale;
+		AssignSettings.MaxLongMoveRepairs = MaxLongMoveRepairs;
 
 		TArray<int32> Assignment;
 		FSwarmAssignStats Stats;
@@ -1298,9 +1343,9 @@ bool ASwarmBossManager::RebalanceToCounts(TConstArrayView<TPair<ESwarmPartId, in
 		}
 
 		UE_LOG(LogSwarmBossManager, Display,
-			TEXT("Assign %s: N=%d MaxMove=%.1f AvgMove=%.1f LongMoves=%d Leftovers=%d Time=%.2fms"),
+			TEXT("Assign %s: N=%d MaxMove=%.1f AvgMove=%.1f LongMoves=%d (Greedy=%d Repaired=%d) Leftovers=%d Time=%.2fms"),
 			*UEnum::GetValueAsString(PartId), TargetCount, Stats.MaxMove, Stats.AverageMove, Stats.LongMoves,
-			Stats.Leftovers, Stats.Milliseconds);
+			Stats.GreedyLongMoves, Stats.Repaired, Stats.Leftovers, Stats.Milliseconds);
 
 		for (int32 ParticleIndex = 0; ParticleIndex < ParticleIds.Num(); ++ParticleIndex)
 		{
@@ -1310,7 +1355,14 @@ bool ASwarmBossManager::RebalanceToCounts(TConstArrayView<TPair<ESwarmPartId, in
 				return false;
 			}
 		}
+
+		// 개수가 그대로인데 구체가 드나든 부위는 위에서 샘플링한 뒤 AssignStart를 재므로, 그 시간은 샘플링에만 들어간다.
+		AssignMs += MillisecondsSince(AssignStart);
 	}
+
+	UE_LOG(LogSwarmBossManager, Display,
+		TEXT("Rebalance timing %s: Total=%.2fms Sampling=%.2fms Placement=%.2fms Transfer=%.2fms Assign=%.2fms Parts=%d"),
+		*GetName(), MillisecondsSince(RebalanceStart), SamplingMs, PlacementMs, TransferMs, AssignMs, ProcessedParts);
 
 	return true;
 }
@@ -1444,7 +1496,29 @@ void ASwarmBossManager::Tick(float DeltaTime)
 		}
 	}
 
-	if (!UpdateParticleMovement(DeltaTime) && !bRebalancePending)
+	const double MovementStart = FPlatformTime::Seconds();
+	const bool bStillMoving = UpdateParticleMovement(DeltaTime);
+	const double MovementMs = (FPlatformTime::Seconds() - MovementStart) * 1000.0;
+	++MovementFrames;
+	MovementTotalMs += MovementMs;
+	MovementMaxMs = FMath::Max(MovementMaxMs, MovementMs);
+
+	// 측정: 이동이 끝나면 이번 이동 구간의 프레임당 이동 갱신 시간을 한 줄로 남긴다.
+	// 움직이는 구체 없이 피해 구간만 기다리던 Tick(1프레임짜리)은 남기지 않는다.
+	if (!bStillMoving)
+	{
+		if (MovementFrames > 1)
+		{
+			UE_LOG(LogSwarmBossManager, Display, TEXT("Movement timing %s: Frames=%d Avg=%.2fms Max=%.2fms"),
+				*GetName(), MovementFrames, MovementTotalMs / MovementFrames, MovementMaxMs);
+		}
+
+		MovementFrames = 0;
+		MovementTotalMs = 0.0;
+		MovementMaxMs = 0.0;
+	}
+
+	if (!bStillMoving && !bRebalancePending)
 	{
 		SetActorTickEnabled(false);
 	}
@@ -1497,6 +1571,7 @@ FBox ASwarmBossManager::GetSwarmBounds() const
 // 성공적으로 갱신한 구체 중 아직 목표에 도착하지 않은 구체가 있으면 true를 반환한다.
 bool ASwarmBossManager::UpdateParticleMovement(float DeltaTime)
 {
+	TRACE_CPUPROFILER_EVENT_SCOPE(Swarm_UpdateMovement);
 	constexpr float MoveSpeed = 200.0f; // cm/s
 	TArray<UInstancedStaticMeshComponent*, TInlineAllocator<2>> ChangedInstances;
 	bool bHasMovingParticles = false;

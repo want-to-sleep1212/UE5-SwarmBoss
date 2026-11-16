@@ -9,6 +9,7 @@
 #include "SwarmShapeSampler.h"
 
 #include "HAL/PlatformTime.h"
+#include "ProfilingDebugging/CpuProfilerTrace.h"
 
 namespace
 {
@@ -119,6 +120,20 @@ namespace
 	}
 }
 
+// 박스는 축마다 [-HalfExtents, HalfExtents]로 자르고, 구는 중심에서 반지름(HalfExtents.X)보다 멀면 반지름 위로 당긴다.
+FVector FSwarmShapeSampler::ClampInside(const FVector& Point, ESwarmPrimitive Shape, const FVector& HalfExtents)
+{
+	if (Shape == ESwarmPrimitive::Sphere)
+	{
+		return Point.SizeSquared() > FMath::Square(HalfExtents.X) ? Point.GetSafeNormal() * HalfExtents.X : Point;
+	}
+
+	return FVector(
+		FMath::Clamp(Point.X, -HalfExtents.X, HalfExtents.X),
+		FMath::Clamp(Point.Y, -HalfExtents.Y, HalfExtents.Y),
+		FMath::Clamp(Point.Z, -HalfExtents.Z, HalfExtents.Z));
+}
+
 // 원점을 중심으로 한 Shape 도형 안에 Point가 있는지 반환한다.
 // HalfExtents는 구에서는 X값이 반지름이고, 박스에서는 각 축의 반길이다.
 bool FSwarmShapeSampler::Contains(const FVector& Point, ESwarmPrimitive Shape, const FVector& HalfExtents)
@@ -172,6 +187,7 @@ bool FSwarmShapeSampler::ValidateTargets(const TArray<FVector>& Points, ESwarmPr
 // 점이 부족하면 허용 범위 내에서 도형을 확대해 재시도한다. 반환 결과의 bSuccess로 성공 여부를 확인한다.
 FSwarmSamplingResult FSwarmShapeSampler::GenerateTargets(const FSwarmSamplingSettings& S)
 {
+	TRACE_CPUPROFILER_EVENT_SCOPE(Swarm_GenerateTargets);
 	FSwarmSamplingResult Result;
 	const double Start = FPlatformTime::Seconds();
 

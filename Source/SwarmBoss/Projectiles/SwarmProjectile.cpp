@@ -4,6 +4,8 @@
 #include "Components/StaticMeshComponent.h"
 #include "Engine/StaticMesh.h"
 #include "Engine/World.h"
+#include "HAL/PlatformTime.h"
+#include "ProfilingDebugging/CpuProfilerTrace.h"
 #include "SwarmBoss.h"
 #include "UObject/ConstructorHelpers.h"
 
@@ -56,6 +58,7 @@ void ASwarmProjectile::Tick(float DeltaTime)
 // 그 앞까지 닿은 군체 구체만 Manager별로 모아 제거한다. 벽이 없으면 구간 끝으로 이동해 계속 날아간다.
 bool ASwarmProjectile::Advance(float DeltaTime)
 {
+	TRACE_CPUPROFILER_EVENT_SCOPE(Swarm_ProjectileAdvance);
 	UWorld* World = GetWorld();
 
 	if (!World || IsActorBeingDestroyed() || DeltaTime <= 0.0f || Velocity.IsNearlyZero())
@@ -114,13 +117,15 @@ bool ASwarmProjectile::Advance(float DeltaTime)
 			OpenWindowBosses.Add(Pair.Key);
 		}
 
+		const double RemoveStart = FPlatformTime::Seconds();
 		const int32 RemovedCount = Pair.Key->RemoveHitInstances(Pair.Value);
+		const double RemoveMs = (FPlatformTime::Seconds() - RemoveStart) * 1000.0;
 		TotalRemovedCount += RemovedCount;
 
 		if (RemovedCount > 0)
 		{
-			UE_LOG(LogSwarmBoss, Display, TEXT("Projectile passed through %s: Removed=%d Total=%d Remaining=%d"),
-				*Pair.Key->GetName(), RemovedCount, TotalRemovedCount, Pair.Key->GetActiveParticleCount());
+			UE_LOG(LogSwarmBoss, Display, TEXT("Projectile passed through %s: Removed=%d Total=%d Remaining=%d RemoveTime=%.2fms"),
+				*Pair.Key->GetName(), RemovedCount, TotalRemovedCount, Pair.Key->GetActiveParticleCount(), RemoveMs);
 		}
 	}
 

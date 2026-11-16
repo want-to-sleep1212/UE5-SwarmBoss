@@ -154,9 +154,23 @@ private:
 	UPROPERTY(EditAnywhere, Category="Swarm|Rebalance", meta=(ClampMin="1", ClampMax="64"))
 	int32 AssignCandidateCount = 12;
 
-	// 먼 이동 기준 = 구체 중심 최소 간격 d × 이 값. 지금은 배정 로그의 LongMoves 통계에만 쓴다.
+	// 먼 이동 기준 = 구체 중심 최소 간격 d × 이 값. 이보다 먼 배정은 도미노로 고치며, 고친 사슬 안 이동은 모두 이 기준 이내다.
 	UPROPERTY(EditAnywhere, Category="Swarm|Rebalance", meta=(ClampMin="0.5", ClampMax="10"))
 	float LongMoveThresholdScale = 2.0f;
+
+	// 재분배 때 부위마다 도미노 고치기를 시도할 최대 수. 시간 상한용이며 넘는 먼 이동은 그리디 결과 그대로 둔다. 0이면 고치지 않는다.
+	UPROPERTY(EditAnywhere, Category="Swarm|Rebalance", meta=(ClampMin="0", ClampMax="1000"))
+	int32 MaxLongMoveRepairs = 200;
+
+	// 재분배 샘플링에서 활성점 하나마다 시험할 후보 수(Bridson의 k). 초기 생성은 샘플링 설정 값(30)을 그대로 쓴다.
+	// 줄이면 샘플링이 빨라지는 대신 배치가 약간 덜 촘촘해질 수 있다(재분배마다 몸 전체를 다시 샘플링하는 비용 절감용).
+	UPROPERTY(EditAnywhere, Category="Swarm|Rebalance", meta=(ClampMin="1", ClampMax="100"))
+	int32 RebalanceCandidatesPerPoint = 15;
+
+	// 측정용: 구체가 움직이는 동안의 이동 갱신 프레임 수, 합계·최대 시간(ms). 이동이 끝나면 한 줄로 남기고 비운다.
+	int32 MovementFrames = 0;
+	double MovementTotalMs = 0.0;
+	double MovementMaxMs = 0.0;
 
 	// 손실 후 아직 재분배하지 않았으면 true. 열린 피해 구간 수가 0이 된 뒤 Tick에서 처리하고 지운다.
 	bool bRebalancePending = false;
