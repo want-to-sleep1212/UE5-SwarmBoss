@@ -96,6 +96,37 @@ namespace
 		return ParentPoint + Normal * (Child.Gap + ParentRadius + ChildRadius) - ChildPoint;
 	}
 
+	// 자식 부위 로컬에서 관절 피벗 점. ChildAnchor에서 X·Y를 0으로 둔 (0, 0, ChildAnchor.Z) 비율이다.
+	// 거인 부위는 모두 자기 Z축 방향으로 길고 위·아래 끝에서 이어지므로, 팔처럼 옆면 위 모서리(0, ±1, 1)로 붙어도
+	// 실제 관절처럼 윗면 가운데에서 돈다(사용자 결정, 2026-11-17). 검은 관절 없이 통째로 움직이므로 해당 없다.
+	// 위치 계산은 GetAnchorPoint()와 같다. 구에서는 구 밖으로 나간 점만 표면으로 당기며 안쪽 점은 그대로 둔다.
+	FVector GetPivotPoint(const FSwarmPartDefinition& Definition, const FVector& HalfExtents)
+	{
+		return GetAnchorPoint(Definition.Shape, FVector(0.0, 0.0, Definition.ChildAnchor.Z), HalfExtents);
+	}
+
+	// 부모 ISM 기준 자식 ISM의 상대 변환. 기본 위치 P0(ComputeChildLocation)·기본 회전 R0(RelativeRotation)에서
+	// 피벗 J = P0 + R0·피벗점을 중심으로 Pose만큼 돌린다: 위치 = J + Pose·(P0 - J), 회전 = Pose * R0.
+	// FQuat 곱 A * B는 B를 먼저 적용하므로 Pose * R0는 기본 회전 뒤에 부모 축 기준 자세를 더한 것이다. Pose가 회전 없음이면 기본 배치와 같다.
+	FTransform ComputeChildRelativeTransform(const FSwarmPartDefinition& Child, const FVector& ChildHalfExtents,
+		double ChildRadius, ESwarmPrimitive ParentShape, const FVector& ParentHalfExtents, double ParentRadius,
+		const FQuat& Pose)
+	{
+		const FVector RestLocation = ComputeChildLocation(Child, ChildHalfExtents, ChildRadius, ParentShape,
+			ParentHalfExtents, ParentRadius);
+		const FQuat RestRotation = Child.RelativeRotation.Quaternion();
+		const FVector Pivot = RestLocation + RestRotation.RotateVector(GetPivotPoint(Child, ChildHalfExtents));
+
+		return FTransform(Pose * RestRotation, Pivot + Pose.RotateVector(RestLocation - Pivot));
+	}
+
+	// 자세가 쓸 수 있는 회전인지(NaN·무한대가 아니고 정규화할 수 있는지) 확인한다.
+	bool IsValidPose(const FQuat& Pose)
+	{
+		return !Pose.ContainsNaN() && FMath::IsFinite(Pose.X) && FMath::IsFinite(Pose.Y) && FMath::IsFinite(Pose.Z)
+			&& FMath::IsFinite(Pose.W) && Pose.SizeSquared() > UE_SMALL_NUMBER;
+	}
+
 	// 부위 기준 → 루트 기준 변환 PartToRoot로 놓인 부위가 차지하는 가장 낮은 Z(루트 기준)를 반환한다.
 	// 도형 경계는 구체 중심 허용 영역이므로, 경계의 가장 낮은 점에서 구체 반지름만큼 더 내려간 곳이 구체 표면의 바닥이다.
 	// 박스는 회전을 반영한 8개 꼭짓점 중 가장 낮은 점, 구는 중심에서 반지름만큼 아래 점을 경계의 바닥으로 쓴다.
@@ -257,35 +288,63 @@ void ASwarmBossManager::ApplyPartPlacement(bool bPreserveParticleWorldPositions)
 		}
 	}
 
-	for (TPair<ESwarmPartId, FSwarmPart>& Pair : Parts)
+	// 부모 ISM 기준 상대 변환을 부위 정의·현재 도형 크기·저장된 자세로 계산한다. bWithPose가 false면 자세를 빼고 기본 자세로 계산한다.
+	auto ComputeRelative = [this](const FSwarmPart& Part, bool bWithPose)
 	{
-		FSwarmPart& Part = Pair.Value;
 		const FSwarmPartDefinition& Definition = Part.Definition;
-		FVector Location = FVector::ZeroVector;
 
-		if (Definition.ParentPartId != ESwarmPartId::None)
+		if (Definition.ParentPartId == ESwarmPartId::None)
 		{
-			const FSwarmPart& Parent = Parts.FindChecked(Definition.ParentPartId);
-			Location = ComputeChildLocation(Definition, Part.HalfExtents, Part.SamplingSettings.ParticleRadius,
-				Parent.Definition.Shape, Parent.HalfExtents, Parent.SamplingSettings.ParticleRadius);
+			return FTransform(Definition.RelativeRotation.Quaternion());
 		}
 
-		Part.Instances->SetRelativeLocationAndRotation(Location, Definition.RelativeRotation);
-	}
+		const FSwarmPart& Parent = Parts.FindChecked(Definition.ParentPartId);
+		return ComputeChildRelativeTransform(Definition, Part.HalfExtents, Part.SamplingSettings.ParticleRadius,
+			Parent.Definition.Shape, Parent.HalfExtents, Parent.SamplingSettings.ParticleRadius,
+			bWithPose ? Part.Pose : FQuat::Identity);
+	};
 
-	// 최상위 부위가 루트 중심에 있는 상태에서 바닥을 재고, 그만큼 최상위 부위를 올린다. 자식 ISM은 붙어 있어 함께 올라간다.
-	const FTransform RootTransform = GetRootComponent()->GetComponentTransform();
-	double LowestZ = TNumericLimits<double>::Max();
 	FSwarmPart* RootPart = nullptr;
 
 	for (TPair<ESwarmPartId, FSwarmPart>& Pair : Parts)
 	{
 		FSwarmPart& Part = Pair.Value;
+		const FTransform Relative = ComputeRelative(Part, /*bWithPose=*/true);
+		Part.Instances->SetRelativeLocationAndRotation(Relative.GetLocation(), Relative.GetRotation());
 
 		if (Part.Definition.ParentPartId == ESwarmPartId::None)
 		{
 			RootPart = &Part;
 		}
+	}
+
+	// 바닥은 자세를 뺀 기본 자세로 계산해, 같은 도형 크기에서는 팔·다리를 돌려도 몸 높이가 바뀌지 않게 한다.
+	// 실제 컴포넌트 위치를 읽지 않고, 부위마다 자세 없는 상대 변환을 부모 쪽으로 누적해 루트 기준 변환을 구한다.
+	// - 모든 조상의 자세를 빼고 각 부위의 기본 회전(RelativeRotation)은 넣는다.
+	// - 최상위 부위의 높이 보정은 넣지 않는다(최상위는 루트 중심·기본 회전만).
+	// - TMap 순회 순서와 무관하게 부모를 따라 재귀로 누적한다. FTransform 곱 A * B는 A를 먼저 적용하므로 자식상대 * 부모→루트다.
+	TMap<ESwarmPartId, FTransform> RestToRoot;
+	TFunction<FTransform(ESwarmPartId)> GetRestToRoot = [&](ESwarmPartId PartId) -> FTransform
+	{
+		if (const FTransform* Cached = RestToRoot.Find(PartId))
+		{
+			return *Cached;
+		}
+
+		const FSwarmPart& Part = Parts.FindChecked(PartId);
+		const FTransform Relative = ComputeRelative(Part, /*bWithPose=*/false);
+		const FTransform ToRoot = Part.Definition.ParentPartId == ESwarmPartId::None
+			? Relative : Relative * GetRestToRoot(Part.Definition.ParentPartId);
+
+		RestToRoot.Add(PartId, ToRoot);
+		return ToRoot;
+	};
+
+	double LowestZ = TNumericLimits<double>::Max();
+
+	for (TPair<ESwarmPartId, FSwarmPart>& Pair : Parts)
+	{
+		const FSwarmPart& Part = Pair.Value;
 
 		// 목표 구체가 0개인 부위는 HalfExtents가 0이고 화면에 아무것도 없으므로 바닥 계산에서 뺀다.
 		if (Part.HalfExtents.IsZero())
@@ -293,11 +352,11 @@ void ASwarmBossManager::ApplyPartPlacement(bool bPreserveParticleWorldPositions)
 			continue;
 		}
 
-		const FTransform PartToRoot = Part.Instances->GetComponentTransform().GetRelativeTransform(RootTransform);
 		LowestZ = FMath::Min(LowestZ, GetLowestZ(Part.Definition.Shape, Part.HalfExtents,
-			Part.SamplingSettings.ParticleRadius, PartToRoot));
+			Part.SamplingSettings.ParticleRadius, GetRestToRoot(Pair.Key)));
 	}
 
+	// 가장 낮은 기본 자세 구체 표면이 Manager 루트 높이(Z=0)에 오도록 최상위 부위만 올린다. 자식 ISM은 붙어 있어 함께 올라간다.
 	if (RootPart && LowestZ < TNumericLimits<double>::Max())
 	{
 		RootPart->Instances->SetRelativeLocation(FVector(0.0, 0.0, -LowestZ));
@@ -437,6 +496,12 @@ bool ASwarmBossManager::GenerateInitialParts()
 
 	// 샘플링이 모두 성공한 뒤에 ISM 구성을 데이터에 맞춘다. 이후 InitializeParticles()가 모든 부위를 다시 채운다.
 	SyncPartInstances(*FormDefinition);
+
+	// 전체를 다시 만들 때는 자세도 초기화한다. SyncPartInstances()는 같은 부위의 FSwarmPart를 재사용하므로 이전 자세가 남는다.
+	for (TPair<ESwarmPartId, FSwarmPart>& Pair : Parts)
+	{
+		Pair.Value.Pose = FQuat::Identity;
+	}
 
 	if (!InitializeParticles(Placements, TorsoSettings.ParticleRadius))
 	{
@@ -1540,6 +1605,70 @@ void ASwarmBossManager::EndDamageWindow()
 	{
 		SetActorTickEnabled(true);
 	}
+}
+
+// 절대 자세 지정. FRotator를 쿼터니언으로 바꿔 ApplyPartPose()로 넘긴다.
+bool ASwarmBossManager::SetPartPose(ESwarmPartId PartId, const FRotator& Rotation)
+{
+	FSwarmPart* Part = Parts.Find(PartId);
+
+	if (!Part || Rotation.ContainsNaN() || !FMath::IsFinite(Rotation.Pitch) || !FMath::IsFinite(Rotation.Yaw)
+		|| !FMath::IsFinite(Rotation.Roll))
+	{
+		return false;
+	}
+
+	return ApplyPartPose(*Part, Rotation.Quaternion());
+}
+
+// 저장된 쿼터니언에 부모 축 기준 증분을 앞에서 곱한다(Delta * Current: 현재 자세를 적용한 뒤 Delta를 부모 축으로 더함).
+bool ASwarmBossManager::AddPartPoseDelta(ESwarmPartId PartId, const FQuat& Delta)
+{
+	FSwarmPart* Part = Parts.Find(PartId);
+
+	if (!Part || !IsValidPose(Delta))
+	{
+		return false;
+	}
+
+	return ApplyPartPose(*Part, (Delta.GetNormalized() * Part->Pose).GetNormalized());
+}
+
+FQuat ASwarmBossManager::GetPartPose(ESwarmPartId PartId) const
+{
+	const FSwarmPart* Part = Parts.Find(PartId);
+	return Part ? Part->Pose : FQuat::Identity;
+}
+
+// 최상위 부위·잘못된 회전·ISM 없음은 거부하고 기존 자세를 유지한다. 통과하면 자세를 저장하고 이 부위 ISM 하나의 상대 변환만 설정한다.
+// 자식 부위는 부착 계층으로 함께 돌고, 구체·목표는 부위 로컬이라 함께 돈다. 바닥 높이는 기본 자세 기준이라 다시 계산하지 않는다.
+// 측정: 이 호출의 동기 실행 시간만 잰다. 자식 ISM 변환 전파 같은 엔진 내부 비용이 포함되지만, 프레임 전체 비용은 따로 확인해야 한다.
+bool ASwarmBossManager::ApplyPartPose(FSwarmPart& Part, const FQuat& Pose)
+{
+	TRACE_CPUPROFILER_EVENT_SCOPE(Swarm_ApplyPose);
+
+	if (Part.Definition.ParentPartId == ESwarmPartId::None || !IsValidPose(Pose) || !IsValid(Part.Instances))
+	{
+		return false;
+	}
+
+	const FSwarmPart* Parent = Parts.Find(Part.Definition.ParentPartId);
+
+	if (!Parent)
+	{
+		return false;
+	}
+
+	const double Start = FPlatformTime::Seconds();
+	Part.Pose = Pose.GetNormalized();
+	const FTransform Relative = ComputeChildRelativeTransform(Part.Definition, Part.HalfExtents,
+		Part.SamplingSettings.ParticleRadius, Parent->Definition.Shape, Parent->HalfExtents,
+		Parent->SamplingSettings.ParticleRadius, Part.Pose);
+	Part.Instances->SetRelativeLocationAndRotation(Relative.GetLocation(), Relative.GetRotation());
+
+	UE_LOG(LogSwarmBossManager, Display, TEXT("Pose %s: %s Time=%.2fms"), *UEnum::GetValueAsString(Part.Definition.PartId),
+		*Part.Pose.Rotator().ToString(), (FPlatformTime::Seconds() - Start) * 1000.0);
+	return true;
 }
 
 // 부위마다 현재 도형 반크기에 구체 반지름을 더한 로컬 상자를 월드로 변환해 합친다. 구는 세 축 반크기가 반지름이라 같은 식을 쓴다.

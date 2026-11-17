@@ -38,6 +38,11 @@ struct FSwarmPart
 
 	// 현재 목표 배치의 도형 반크기(cm, 구 중심 허용 영역). 구는 세 축 모두 반지름이며, 구체가 0개면 0이다.
 	FVector HalfExtents = FVector::ZeroVector;
+
+	// 현재 자세. 기본 회전(Definition.RelativeRotation)에 더하는 회전이며 축은 부모 부위 로컬 기준이다.
+	// 관절 피벗(이 부위의 (0, 0, ChildAnchor.Z) 점)을 중심으로 돈다. 최상위 부위는 항상 회전 없음이다.
+	// 재분배에서는 유지하고, GenerateInitialParts()로 전체를 다시 만들 때 초기화한다.
+	FQuat Pose = FQuat::Identity;
 };
 
 /** 중앙 구체 저장소와 부위별 ISM을 소유하고, 구체 생성·제거·목표 배정·이동을 처리한다. */
@@ -97,6 +102,18 @@ public:
 		bRebalancePending &= bEnabled;
 	}
 
+	// PartId 부위의 자세를 Rotation으로 바꾼다(절대 지정, 부모 부위 로컬 축 기준, 기본 회전에 더함).
+	// 없는 부위, 최상위 부위, NaN·무한대 회전은 거부하고 기존 자세를 유지한 채 false를 반환한다.
+	bool SetPartPose(ESwarmPartId PartId, const FRotator& Rotation);
+
+	// PartId 부위의 현재 자세에 부모 부위 로컬 축 기준 증분 Delta를 더한다. NewPose = (Delta * CurrentPose).GetNormalized().
+	// 키 입력처럼 축을 섞어 여러 번 돌릴 때 쓴다. FRotator 각도를 더하는 방식은 축을 섞으면 의미가 달라지므로 쓰지 않는다.
+	// 거부 조건과 실패 시 동작은 SetPartPose()와 같다.
+	bool AddPartPoseDelta(ESwarmPartId PartId, const FQuat& Delta);
+
+	// PartId 부위의 현재 자세. 없는 부위는 회전 없음을 반환한다.
+	FQuat GetPartPose(ESwarmPartId PartId) const;
+
 	// 모든 부위의 현재 도형(반크기 + 구체 반지름)을 감싸는 월드 AABB. 구체가 없으면 유효하지 않은 상자를 반환한다.
 	// 피해 구간을 연 투사체가 보스를 벗어났는지 판단할 때 쓴다. 구체를 하나씩 보지 않으므로 부위 수만큼만 계산한다.
 	FBox GetSwarmBounds() const;
@@ -110,6 +127,7 @@ private:
 	friend class FSwarmManagerBehaviorTest;
 	friend class FSwarmNeighborTransferTest;
 	friend class FSwarmAutoRebalanceTest;
+	friend class FSwarmJointPoseTest;
 
 	// 재구성 목표를 배정한 시점부터 도착까지의 게임 시간(초). 변경한 값은 다음 목표 배정부터 적용한다.
 	UPROPERTY(EditAnywhere, Category="Swarm|Movement", meta=(ClampMin="0.01", UIMin="0.01", Units="s"))
@@ -125,6 +143,9 @@ private:
 	bool RebalanceToCounts(TConstArrayView<TPair<ESwarmPartId, int32>> PartTargetCounts);
 
 	FVector GetJointWorldLocation(ESwarmPartId FirstPartId, ESwarmPartId SecondPartId) const;
+
+	// Part의 자세 검사를 마친 Pose를 저장하고, 그 부위 ISM의 상대 위치·회전 하나만 다시 설정한다. 자식 부위는 부착 계층으로 따라 돈다.
+	bool ApplyPartPose(FSwarmPart& Part, const FQuat& Pose);
 	TArray<int32> SelectParticlesNearest(ESwarmPartId PartId, const FVector& WorldPoint, int32 MaxCount,
 		const TSet<int32>& ExcludedParticleIds) const;
 

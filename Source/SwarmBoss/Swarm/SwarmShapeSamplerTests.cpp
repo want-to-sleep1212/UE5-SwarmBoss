@@ -2378,4 +2378,228 @@ bool FSwarmAutoRebalanceTest::RunTest(const FString& Parameters)
 	return true;
 }
 
+namespace
+{
+	// 몸통 + 오른팔 + 오른손 형태 데이터. 오른팔은 몸통 오른쪽(+Y) 면 위쪽에 안쪽 면 위 모서리(0, -1, 1)로 붙어 아래로 늘어진다.
+	// 오른손은 팔 아랫면에 윗면으로 붙고, HandRotation만큼 기본 회전이 있다.
+	USwarmFormDefinition* CreateArmPoseDefinition(const FRotator& HandRotation)
+	{
+		USwarmFormDefinition* Definition = NewObject<USwarmFormDefinition>(GetTransientPackage());
+
+		FSwarmPartDefinition& Torso = Definition->Parts.AddDefaulted_GetRef();
+		Torso.PartId = ESwarmPartId::Torso;
+		Torso.ParentPartId = ESwarmPartId::None;
+		Torso.Shape = ESwarmPrimitive::Box;
+		Torso.BoxHalfExtentsRatio = FVector(1.0, 0.75, 1.5);
+		Torso.AllocationWeight = 4;
+
+		FSwarmPartDefinition& Arm = Definition->Parts.AddDefaulted_GetRef();
+		Arm.PartId = ESwarmPartId::RightArm;
+		Arm.ParentPartId = ESwarmPartId::Torso;
+		Arm.Shape = ESwarmPrimitive::Box;
+		Arm.BoxHalfExtentsRatio = FVector(0.45, 0.45, 1.0);
+		Arm.AllocationWeight = 2;
+		Arm.ParentAnchor = FVector(0.0, 1.0, 1.0);
+		Arm.ChildAnchor = FVector(0.0, -1.0, 1.0);
+		Arm.Gap = 10.0f;
+
+		FSwarmPartDefinition& Hand = Definition->Parts.AddDefaulted_GetRef();
+		Hand.PartId = ESwarmPartId::RightHand;
+		Hand.ParentPartId = ESwarmPartId::RightArm;
+		Hand.Shape = ESwarmPrimitive::Box;
+		Hand.BoxHalfExtentsRatio = FVector(0.6, 0.6, 1.0);
+		Hand.AllocationWeight = 1;
+		Hand.ParentAnchor = FVector(0.0, 0.0, -1.0);
+		Hand.ChildAnchor = FVector(0.0, 0.0, 1.0);
+		Hand.Gap = 5.0f;
+		Hand.RelativeRotation = HandRotation;
+
+		return Definition;
+	}
+
+	// 부위 ISM 기준 관절 피벗 점(박스): (0, 0, ChildAnchor.Z) × 반크기. 월드로 바꾸면 회전 전후로 같아야 한다.
+	FVector PivotWorld(const ASwarmBossManager& Boss, ESwarmPartId PartId, const FSwarmPartDefinition& Definition,
+		const FVector& HalfExtents)
+	{
+		return Boss.GetPartInstances(PartId)->GetComponentTransform().TransformPosition(
+			FVector(0.0, 0.0, Definition.ChildAnchor.Z) * HalfExtents);
+	}
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FSwarmJointPoseTest, "SwarmBoss.Stage3.JointPose",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+// 관절 피벗과 부위 자세를 검증한다. 피벗 고정, 회전 방향(키 1·3), 축 혼합 쿼터니언 합성, 손자 부위·구체 연동,
+// 기본 회전이 있는 부위, 회전된 Manager, 실제 재분배 뒤 자세 유지와 이동 완료, 자세와 무관한 바닥 높이,
+// 이동 중 회전, 잘못된 입력 거부, 재생성 시 초기화.
+bool FSwarmJointPoseTest::RunTest(const FString& Parameters)
+{
+	UWorld* World = UWorld::CreateWorld(EWorldType::Game, false);
+
+	if (!TestNotNull(TEXT("Transient world"), World))
+	{
+		return false;
+	}
+
+	ASwarmBossManager* Boss = World->SpawnActor<ASwarmBossManager>();
+
+	if (!TestNotNull(TEXT("Manager"), Boss))
+	{
+		World->DestroyWorld(false);
+		return false;
+	}
+
+	Boss->SetFormDefinition(CreateArmPoseDefinition(FRotator(0.0, 30.0, 0.0)));
+	Boss->SetAutoRebalanceOnLoss(false);
+	Boss->InitialParticleCount = 140;
+
+	if (!TestTrue(TEXT("Generate"), Boss->GenerateInitialParts()))
+	{
+		World->DestroyWorld(false);
+		return false;
+	}
+
+	const float Duration = Boss->ReconstructionDuration;
+	UInstancedStaticMeshComponent* Torso = Boss->GetPartInstances(ESwarmPartId::Torso);
+	UInstancedStaticMeshComponent* Arm = Boss->GetPartInstances(ESwarmPartId::RightArm);
+	UInstancedStaticMeshComponent* Hand = Boss->GetPartInstances(ESwarmPartId::RightHand);
+	const FSwarmPart& ArmPart = Boss->Parts.FindChecked(ESwarmPartId::RightArm);
+	const FSwarmPart& HandPart = Boss->Parts.FindChecked(ESwarmPartId::RightHand);
+	const double Tolerance = 1.e-3;
+
+	TestTrue(TEXT("Initial pose is identity"), Boss->GetPartPose(ESwarmPartId::RightArm).Equals(FQuat::Identity));
+
+	// 1) 키 1(앞 축 +15도)은 팔 끝을 바깥(+Y)·위로 보낸다. 피벗은 그대로이고 손·구체는 피벗을 중심으로 같이 돈다.
+	const FVector ArmPivot = PivotWorld(*Boss, ESwarmPartId::RightArm, ArmPart.Definition, ArmPart.HalfExtents);
+	const FVector ArmCenterBefore = Arm->GetComponentLocation();
+	const FVector HandCenterBefore = Hand->GetComponentLocation();
+	const FTransform ArmTransformBefore = Arm->GetComponentTransform();
+	const FVector ParticleLocal = ArmPart.InstanceToParticle.Num() > 0
+		? Boss->GetParticles()[ArmPart.InstanceToParticle[0]].LocalPosition : FVector::ZeroVector;
+	const FVector ParticleBefore = ArmTransformBefore.TransformPosition(ParticleLocal);
+	const double TorsoZBefore = Torso->GetRelativeLocation().Z;
+	const FQuat SideDelta(FVector::ForwardVector, FMath::DegreesToRadians(15.0));
+	const FQuat ForwardDelta(FVector::RightVector, FMath::DegreesToRadians(-15.0));
+
+	TestTrue(TEXT("Side delta applies"), Boss->AddPartPoseDelta(ESwarmPartId::RightArm, SideDelta));
+	TestTrue(TEXT("Shoulder pivot stays fixed"),
+		PivotWorld(*Boss, ESwarmPartId::RightArm, ArmPart.Definition, ArmPart.HalfExtents).Equals(ArmPivot, Tolerance));
+	TestTrue(TEXT("Key 1 moves the arm outward (+Y)"), Arm->GetComponentLocation().Y > ArmCenterBefore.Y + 1.0);
+	TestTrue(TEXT("Key 1 raises the arm"), Arm->GetComponentLocation().Z > ArmCenterBefore.Z + 1.0);
+
+	// 부모(몸통) 축 기준 회전이므로 월드 회전은 몸통 회전으로 감싼 증분이다.
+	const FQuat TorsoRotation = Torso->GetComponentQuat();
+	const FQuat WorldDelta = TorsoRotation * SideDelta * TorsoRotation.Inverse();
+	TestTrue(TEXT("Hand rotates about the shoulder"), Hand->GetComponentLocation().Equals(
+		ArmPivot + WorldDelta.RotateVector(HandCenterBefore - ArmPivot), Tolerance));
+	TestTrue(TEXT("Particles rotate with the arm"), Arm->GetComponentTransform().TransformPosition(ParticleLocal).Equals(
+		ArmPivot + WorldDelta.RotateVector(ParticleBefore - ArmPivot), Tolerance));
+	TestTrue(TEXT("Arm rotation is pose times rest rotation"), Arm->GetRelativeRotation().Quaternion().Equals(
+		Boss->GetPartPose(ESwarmPartId::RightArm) * ArmPart.Definition.RelativeRotation.Quaternion(), 1.e-4));
+
+	// 2) 키 3(오른쪽 축 -15도)은 기본 자세에서 팔 끝을 앞(+X)으로 보낸다.
+	TestTrue(TEXT("Reset to rest"), Boss->SetPartPose(ESwarmPartId::RightArm, FRotator::ZeroRotator));
+	TestTrue(TEXT("Rest pose restores the arm"), Arm->GetComponentLocation().Equals(ArmCenterBefore, Tolerance));
+	TestTrue(TEXT("Forward delta applies"), Boss->AddPartPoseDelta(ESwarmPartId::RightArm, ForwardDelta));
+	TestTrue(TEXT("Key 3 moves the arm forward (+X)"), Arm->GetComponentLocation().X > ArmCenterBefore.X + 1.0);
+
+	// 3) 축 혼합 1 -> 3 -> 1은 부모 축 기준 쿼터니언 합성(뒤 증분을 앞에서 곱함)과 같아야 한다.
+	Boss->SetPartPose(ESwarmPartId::RightArm, FRotator::ZeroRotator);
+	Boss->AddPartPoseDelta(ESwarmPartId::RightArm, SideDelta);
+	Boss->AddPartPoseDelta(ESwarmPartId::RightArm, ForwardDelta);
+	Boss->AddPartPoseDelta(ESwarmPartId::RightArm, SideDelta);
+	const FQuat Mixed = (SideDelta * ForwardDelta * SideDelta).GetNormalized();
+	TestTrue(TEXT("Mixed axes compose as quaternions"), Boss->GetPartPose(ESwarmPartId::RightArm).Equals(Mixed, 1.e-5));
+	TestTrue(TEXT("Shoulder pivot stays fixed after mixed input"),
+		PivotWorld(*Boss, ESwarmPartId::RightArm, ArmPart.Definition, ArmPart.HalfExtents).Equals(ArmPivot, Tolerance));
+
+	// 4) 기본 회전(Yaw 30도)이 있는 손도 손목 피벗을 중심으로 돈다.
+	const FVector WristPivot = PivotWorld(*Boss, ESwarmPartId::RightHand, HandPart.Definition, HandPart.HalfExtents);
+	TestTrue(TEXT("Hand with rest rotation accepts a pose"),
+		Boss->SetPartPose(ESwarmPartId::RightHand, FRotator(20.0, 0.0, 10.0)));
+	TestTrue(TEXT("Wrist pivot stays fixed with rest rotation"),
+		PivotWorld(*Boss, ESwarmPartId::RightHand, HandPart.Definition, HandPart.HalfExtents).Equals(WristPivot, Tolerance));
+	TestTrue(TEXT("Hand rotation is pose times rest rotation"), Hand->GetRelativeRotation().Quaternion().Equals(
+		Boss->GetPartPose(ESwarmPartId::RightHand) * HandPart.Definition.RelativeRotation.Quaternion(), 1.e-4));
+
+	// 5) 같은 도형 크기에서 자세만 바뀌면 몸통 높이(바닥 맞춤)는 그대로다.
+	TestEqual(TEXT("Posing does not change torso height"), Torso->GetRelativeLocation().Z, TorsoZBefore, Tolerance);
+	Boss->ApplyPartPlacement(/*bPreserveParticleWorldPositions=*/true);
+	TestEqual(TEXT("Re-placement with a pose keeps the rest-pose floor"), Torso->GetRelativeLocation().Z, TorsoZBefore, Tolerance);
+	Boss->Tick(Duration);
+
+	// 6) 잘못된 입력은 거부하고 기존 자세를 유지한다.
+	const FQuat PoseBeforeInvalid = Boss->GetPartPose(ESwarmPartId::RightArm);
+	const double NaN = std::numeric_limits<double>::quiet_NaN();
+	TestFalse(TEXT("Root pose is rejected"), Boss->SetPartPose(ESwarmPartId::Torso, FRotator(10.0, 0.0, 0.0)));
+	TestFalse(TEXT("Missing part is rejected"), Boss->SetPartPose(ESwarmPartId::LeftLeg, FRotator(10.0, 0.0, 0.0)));
+	TestFalse(TEXT("NaN rotation is rejected"), Boss->SetPartPose(ESwarmPartId::RightArm, FRotator(NaN, 0.0, 0.0)));
+	TestFalse(TEXT("Infinite rotation is rejected"), Boss->SetPartPose(ESwarmPartId::RightArm,
+		FRotator(std::numeric_limits<double>::infinity(), 0.0, 0.0)));
+	TestFalse(TEXT("NaN delta is rejected"), Boss->AddPartPoseDelta(ESwarmPartId::RightArm, FQuat(NaN, 0.0, 0.0, 1.0)));
+	TestTrue(TEXT("Rejected input keeps the pose"), Boss->GetPartPose(ESwarmPartId::RightArm).Equals(PoseBeforeInvalid));
+
+	// 7) 실제 재분배: 팔 구체를 지워 개수를 어긋나게 만든 뒤 재분배한다. 자세는 유지되고 관절은 새 크기로 다시 계산되며,
+	//    구체는 이전 월드 위치에서 출발해 이동이 끝나면 새 로컬 목표에 도착한다. 이동 도중 자세를 바꿔도 마찬가지다.
+	for (int32 Index = 0; Index < 12; ++Index)
+	{
+		Boss->RemoveInstance(Arm, 0);
+	}
+
+	const int32 ArmCountBeforeRebalance = Arm->GetInstanceCount();
+	TestTrue(TEXT("Rebalance after arm loss"), Boss->RebalancePartsFromDefinition());
+	TestNotEqual(TEXT("Rebalance really changed the arm count"), Arm->GetInstanceCount(), ArmCountBeforeRebalance);
+	TestTrue(TEXT("Pose is kept through a real rebalance"),
+		Boss->GetPartPose(ESwarmPartId::RightArm).Equals(PoseBeforeInvalid, 1.e-5));
+	TestTrue(TEXT("Arm rotation after rebalance is pose times rest"), Arm->GetRelativeRotation().Quaternion().Equals(
+		Boss->GetPartPose(ESwarmPartId::RightArm) * ArmPart.Definition.RelativeRotation.Quaternion(), 1.e-4));
+
+	Boss->Tick(Duration * 0.5f);
+	TestTrue(TEXT("Pose change during movement"), Boss->AddPartPoseDelta(ESwarmPartId::RightArm, ForwardDelta));
+	Boss->Tick(Duration);
+	Boss->Tick(Duration);
+
+	bool bAllArrived = true;
+
+	for (const FSwarmParticle& Particle : Boss->GetParticles())
+	{
+		bAllArrived &= !Particle.bActive || Particle.LocalPosition.Equals(Particle.TargetLocalPosition);
+	}
+
+	TestTrue(TEXT("All particles reach their local targets under the posed transform"), bAllArrived);
+
+	// 8) 회전된 Manager에서도 키 1은 월드 Y가 아니라 몸통 로컬 오른쪽(+Y)으로 팔을 보낸다.
+	ASwarmBossManager* Turned = World->SpawnActor<ASwarmBossManager>(FVector(5000.0, 0.0, 0.0), FRotator(0.0, 90.0, 0.0));
+
+	if (TestNotNull(TEXT("Turned manager"), Turned))
+	{
+		Turned->SetFormDefinition(CreateArmPoseDefinition(FRotator::ZeroRotator));
+		Turned->SetAutoRebalanceOnLoss(false);
+
+		if (TestTrue(TEXT("Turned generate"), Turned->GenerateInitialParts()))
+		{
+			UInstancedStaticMeshComponent* TurnedArm = Turned->GetPartInstances(ESwarmPartId::RightArm);
+			const FVector TorsoRight = Turned->GetPartInstances(ESwarmPartId::Torso)->GetRightVector();
+			const FVector Before = TurnedArm->GetComponentLocation();
+			Turned->AddPartPoseDelta(ESwarmPartId::RightArm, SideDelta);
+			const FVector Moved = TurnedArm->GetComponentLocation() - Before;
+			TestTrue(TEXT("Turned key 1 follows the torso right axis"), FVector::DotProduct(Moved, TorsoRight) > 1.0);
+			TestTrue(TEXT("Turned key 1 is not along world Y"), FMath::Abs(Moved.Y) < FMath::Abs(FVector::DotProduct(Moved, TorsoRight)));
+		}
+	}
+
+	// 9) 전체 재생성은 자세를 초기화한다.
+	TestTrue(TEXT("Regenerate"), Boss->GenerateInitialParts());
+	TestTrue(TEXT("Regenerate resets the arm pose"), Boss->GetPartPose(ESwarmPartId::RightArm).Equals(FQuat::Identity));
+	TestTrue(TEXT("Regenerate resets the hand pose"), Boss->GetPartPose(ESwarmPartId::RightHand).Equals(FQuat::Identity));
+	// 재생성은 부위 맵을 다시 맞추므로 앞에서 잡은 참조 대신 다시 찾는다.
+	const FSwarmPart& RegeneratedArm = Boss->Parts.FindChecked(ESwarmPartId::RightArm);
+	TestTrue(TEXT("Regenerated arm uses its rest rotation"),
+		RegeneratedArm.Instances->GetRelativeRotation().Quaternion().Equals(
+			RegeneratedArm.Definition.RelativeRotation.Quaternion(), 1.e-4));
+
+	World->DestroyWorld(false);
+	return true;
+}
+
 #endif

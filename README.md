@@ -42,6 +42,8 @@ git lfs pull
 5. `ASwarmBossPlayerController`를 사용하는 플레이어로 중앙 조준선을 맞추고 왼쪽 버튼을 누르면 반지름 15cm 관통 구체가 날아가 경로의 구체를 모두 지웁니다. 쿨타임은 2초입니다. 쿨타임·속도·반지름은 PlayerController의 `Swarm|Attack`에서 바꿉니다.
 6. 구체를 맞히면 투사체가 보스를 지나간 뒤 모든 부위의 생존 합계를 `DA_GiantForm`의 가중치 비율로 자동 재분배합니다. Manager의 `Swarm|Rebalance`에서 `Auto Rebalance On Loss`로 끌 수 있습니다. `T`를 누르면 같은 재분배를 수동으로 실행합니다. 이미 개수 비율이 맞으면 재생성하지 않습니다. Output Log의 `Assign` 줄에서 부위별 최대·평균 이동과 먼 이동 수를 볼 수 있습니다.
 
+7. `1`~`4` 키로 오른팔을 어깨 관절 기준으로 돌립니다. `1` 옆으로 들기, `2` 내리기, `3` 앞으로, `4` 뒤로이며 한 번에 15도입니다(PlayerController `Swarm|Pose`의 `Pose Step Degrees`). 팔을 돌려도 몸 높이는 바뀌지 않고, 재분배 뒤에도 자세가 유지됩니다.
+
 `R` 재구성과 `T` 1,000cm 이동은 과거 테스트 입력입니다. 현재 T는 재분배이며 R은 연결되어 있지 않습니다. Preview만 배치하면 현재 게임플레이 기능을 시험할 수 없습니다.
 
 ## 검증

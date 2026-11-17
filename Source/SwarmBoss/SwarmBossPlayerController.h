@@ -4,6 +4,7 @@
 
 #include "CoreMinimal.h"
 #include "GameFramework/PlayerController.h"
+#include "Swarm/SwarmPartTypes.h"
 #include "SwarmBossPlayerController.generated.h"
 
 class UInputMappingContext;
@@ -76,6 +77,20 @@ protected:
 
 	// T 키로 레벨의 Manager마다 모든 부위 생존 수를 형태 데이터의 가중치 비율로 맞추고 새 도형 목표로 이동시킨다.
 	void RebalanceSwarmPartsForTest();
+
+	// 부위 자세 확인용 입력(1~4). 오른팔을 어깨 관절 기준으로 PoseStepDegrees씩 돌린다.
+	// 1: 옆으로 들기, 2: 옆으로 내리기(몸통 부모의 앞 방향 X축 기준), 3: 앞으로 들기, 4: 뒤로 들기(오른쪽 방향 Y축 기준).
+	void RaiseRightArmSideForTest();
+	void LowerRightArmSideForTest();
+	void RaiseRightArmForwardForTest();
+	void RaiseRightArmBackwardForTest();
+
+	// 레벨의 Manager마다 PartId 부위 자세에 부모 부위 로컬 Axis 기준 Degrees만큼 회전 증분을 더한다.
+	void AdjustSwarmPartPoseForTest(ESwarmPartId PartId, const FVector& Axis, float Degrees);
+
+	// 자세 확인 키 한 번에 돌리는 각도(도).
+	UPROPERTY(EditAnywhere, Category="Swarm|Pose", meta=(ClampMin="1", ClampMax="90", Units="deg"))
+	float PoseStepDegrees = 15.0f;
 
 	/** Returns true if the player should use UMG touch controls */
 	bool ShouldUseTouchControls() const;

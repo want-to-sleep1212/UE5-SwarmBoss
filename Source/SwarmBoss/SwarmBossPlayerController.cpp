@@ -78,6 +78,12 @@ void ASwarmBossPlayerController::SetupInputComponent()
 			this,
 			&ASwarmBossPlayerController::RebalanceSwarmPartsForTest);
 
+		// 부위 자세 확인용: 오른팔을 어깨 관절 기준으로 옆(1·2), 앞뒤(3·4)로 돌린다.
+		InputComponent->BindKey(EKeys::One, IE_Pressed, this, &ASwarmBossPlayerController::RaiseRightArmSideForTest);
+		InputComponent->BindKey(EKeys::Two, IE_Pressed, this, &ASwarmBossPlayerController::LowerRightArmSideForTest);
+		InputComponent->BindKey(EKeys::Three, IE_Pressed, this, &ASwarmBossPlayerController::RaiseRightArmForwardForTest);
+		InputComponent->BindKey(EKeys::Four, IE_Pressed, this, &ASwarmBossPlayerController::RaiseRightArmBackwardForTest);
+
 	}
 
 
@@ -147,6 +153,52 @@ void ASwarmBossPlayerController::TryFireProjectile()
 	{
 		Projectile->Launch(Direction, ProjectileSpeed, ProjectileRadius);
 		LastFireTime = Now;
+	}
+}
+
+// 회전 증분은 축·각으로 만든 쿼터니언이다. 오른팔은 몸통의 +Y 쪽에 붙어 아래(-Z)로 늘어져 있으므로,
+// FQuat(축, 각)의 회전식(y' = y·cos - z·sin 등)에 팔 끝 방향 (0, 0, -1)을 넣으면
+// +X(앞) 축 기준 양의 각은 팔 끝을 +Y(바깥)로, +Y(오른쪽) 축 기준 음의 각은 팔 끝을 +X(앞)로 보낸다.
+// 부호는 JointPose 테스트에서 기본 자세 기준으로 확인한다.
+void ASwarmBossPlayerController::RaiseRightArmSideForTest()
+{
+	AdjustSwarmPartPoseForTest(ESwarmPartId::RightArm, FVector::ForwardVector, PoseStepDegrees);
+}
+
+void ASwarmBossPlayerController::LowerRightArmSideForTest()
+{
+	AdjustSwarmPartPoseForTest(ESwarmPartId::RightArm, FVector::ForwardVector, -PoseStepDegrees);
+}
+
+void ASwarmBossPlayerController::RaiseRightArmForwardForTest()
+{
+	AdjustSwarmPartPoseForTest(ESwarmPartId::RightArm, FVector::RightVector, -PoseStepDegrees);
+}
+
+void ASwarmBossPlayerController::RaiseRightArmBackwardForTest()
+{
+	AdjustSwarmPartPoseForTest(ESwarmPartId::RightArm, FVector::RightVector, PoseStepDegrees);
+}
+
+// 축은 부모 부위(오른팔이면 몸통) 로컬 기준이다. Manager가 저장된 쿼터니언에 증분을 앞에서 곱한다.
+void ASwarmBossPlayerController::AdjustSwarmPartPoseForTest(ESwarmPartId PartId, const FVector& Axis, float Degrees)
+{
+	UWorld* World = GetWorld();
+
+	if (!World || !IsLocalPlayerController())
+	{
+		return;
+	}
+
+	const FQuat Delta(Axis.GetSafeNormal(), FMath::DegreesToRadians(Degrees));
+
+	for (TActorIterator<ASwarmBossManager> Boss(World); Boss; ++Boss)
+	{
+		if (!Boss->AddPartPoseDelta(PartId, Delta))
+		{
+			UE_LOG(LogSwarmBoss, Warning, TEXT("Pose change failed for %s on %s."), *UEnum::GetValueAsString(PartId),
+				*Boss->GetName());
+		}
 	}
 }
 
