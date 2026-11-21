@@ -92,6 +92,22 @@ protected:
 	UPROPERTY(EditAnywhere, Category="Swarm|Pose", meta=(ClampMin="1", ClampMax="90", Units="deg"))
 	float PoseStepDegrees = 15.0f;
 
+	// 5 키: 애니메이션 자세 전달 순환. 끔 → Idle(반복) → 걷기(반복) → 공격(1회 후 Idle 반복) → 끔.
+	// 끄면 기본 자세로 돌아간다. 단일 애니메이션 즉시 전환이며 블렌딩은 없다(AnimBP 전환은 후속 작업).
+	void CyclePoseAnimationForTest();
+
+	UPROPERTY(EditAnywhere, Category="Swarm|Animation")
+	TObjectPtr<class UAnimSequence> IdleAnimation;
+
+	UPROPERTY(EditAnywhere, Category="Swarm|Animation")
+	TObjectPtr<class UAnimSequence> WalkAnimation;
+
+	UPROPERTY(EditAnywhere, Category="Swarm|Animation")
+	TObjectPtr<class UAnimSequence> AttackAnimation;
+
+	// 0 끔, 1 Idle, 2 걷기, 3 공격.
+	int32 PoseAnimationState = 0;
+
 	/** Returns true if the player should use UMG touch controls */
 	bool ShouldUseTouchControls() const;
 };

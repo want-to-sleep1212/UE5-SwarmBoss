@@ -3,7 +3,9 @@
 
 #include "SwarmBossPlayerController.h"
 
+#include "Animation/AnimSequence.h"
 #include "Components/InputComponent.h"
+#include "UObject/ConstructorHelpers.h"
 #include "Engine/World.h"
 #include "EngineUtils.h"
 #include "SwarmCrosshairHUD.h"
@@ -24,6 +26,17 @@ ASwarmBossPlayerController::ASwarmBossPlayerController()
 {
 	// set the player camera manager class
 	PlayerCameraManagerClass = ASwarmBossCameraManager::StaticClass();
+
+	// 5 키 순환에 쓰는 마네킹 애니메이션(Git LFS로 추적, Docs/DemoAssets.md).
+	static ConstructorHelpers::FObjectFinder<UAnimSequence> Idle(TEXT("/Game/Characters/Mannequins/Anims/Unarmed/MM_Idle.MM_Idle"));
+	static ConstructorHelpers::FObjectFinder<UAnimSequence> Walk(
+		TEXT("/Game/Characters/Mannequins/Anims/Unarmed/Walk/MF_Unarmed_Walk_Fwd.MF_Unarmed_Walk_Fwd"));
+	static ConstructorHelpers::FObjectFinder<UAnimSequence> Attack(
+		TEXT("/Game/Characters/Mannequins/Anims/Unarmed/Attack/MM_Attack_01.MM_Attack_01"));
+
+	IdleAnimation = Idle.Succeeded() ? Idle.Object : nullptr;
+	WalkAnimation = Walk.Succeeded() ? Walk.Object : nullptr;
+	AttackAnimation = Attack.Succeeded() ? Attack.Object : nullptr;
 }
 
 // 로컬 플레이어의 조준선을 설정하고, 터치 입력을 쓰는 환경에서는 터치 위젯을 표시한다.
@@ -83,6 +96,9 @@ void ASwarmBossPlayerController::SetupInputComponent()
 		InputComponent->BindKey(EKeys::Two, IE_Pressed, this, &ASwarmBossPlayerController::LowerRightArmSideForTest);
 		InputComponent->BindKey(EKeys::Three, IE_Pressed, this, &ASwarmBossPlayerController::RaiseRightArmForwardForTest);
 		InputComponent->BindKey(EKeys::Four, IE_Pressed, this, &ASwarmBossPlayerController::RaiseRightArmBackwardForTest);
+
+		// 애니메이션 자세 전달 확인용: 끔 → Idle → 걷기 → 공격 → 끔 순환.
+		InputComponent->BindKey(EKeys::Five, IE_Pressed, this, &ASwarmBossPlayerController::CyclePoseAnimationForTest);
 
 	}
 
@@ -194,10 +210,56 @@ void ASwarmBossPlayerController::AdjustSwarmPartPoseForTest(ESwarmPartId PartId,
 
 	for (TActorIterator<ASwarmBossManager> Boss(World); Boss; ++Boss)
 	{
+		// 애니메이션 자세 전달 중에는 매 프레임 절대 자세로 덮어써지므로 수동 자세를 받지 않는다.
+		if (Boss->IsPoseAnimationActive())
+		{
+			UE_LOG(LogSwarmBoss, Display, TEXT("Manual pose ignored on %s while a pose animation is playing."), *Boss->GetName());
+			continue;
+		}
+
 		if (!Boss->AddPartPoseDelta(PartId, Delta))
 		{
 			UE_LOG(LogSwarmBoss, Warning, TEXT("Pose change failed for %s on %s."), *UEnum::GetValueAsString(PartId),
 				*Boss->GetName());
+		}
+	}
+}
+
+// 상태를 한 칸 넘기고 레벨의 Manager마다 같은 애니메이션을 재생하거나 멈춘다. 재생에 실패하면 경고를 남긴다.
+void ASwarmBossPlayerController::CyclePoseAnimationForTest()
+{
+	UWorld* World = GetWorld();
+
+	if (!World || !IsLocalPlayerController())
+	{
+		return;
+	}
+
+	PoseAnimationState = (PoseAnimationState + 1) % 4;
+
+	for (TActorIterator<ASwarmBossManager> Boss(World); Boss; ++Boss)
+	{
+		bool bOk = true;
+
+		switch (PoseAnimationState)
+		{
+		case 1:
+			bOk = Boss->PlayPoseAnimation(IdleAnimation, /*bLoop=*/true);
+			break;
+		case 2:
+			bOk = Boss->PlayPoseAnimation(WalkAnimation, /*bLoop=*/true);
+			break;
+		case 3:
+			bOk = Boss->PlayPoseAnimation(AttackAnimation, /*bLoop=*/false);
+			break;
+		default:
+			Boss->StopPoseAnimation();
+			break;
+		}
+
+		if (!bOk)
+		{
+			UE_LOG(LogSwarmBoss, Warning, TEXT("Pose animation state %d failed on %s."), PoseAnimationState, *Boss->GetName());
 		}
 	}
 }

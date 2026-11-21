@@ -18,6 +18,9 @@
 #include "Swarm/SwarmTargetAssigner.h"
 #include "Projectiles/SwarmProjectile.h"
 #include "Engine/StaticMeshActor.h"
+#include "Animation/AnimSequence.h"
+#include "Animation/AnimSingleNodeInstance.h"
+#include "Components/SkeletalMeshComponent.h"
 #include "SwarmShapePreview.h"
 #include "Components/InstancedStaticMeshComponent.h"
 #include "Engine/World.h"
@@ -2597,6 +2600,287 @@ bool FSwarmJointPoseTest::RunTest(const FString& Parameters)
 	TestTrue(TEXT("Regenerated arm uses its rest rotation"),
 		RegeneratedArm.Instances->GetRelativeRotation().Quaternion().Equals(
 			RegeneratedArm.Definition.RelativeRotation.Quaternion(), 1.e-4));
+
+	World->DestroyWorld(false);
+	return true;
+}
+
+namespace
+{
+	// 거인 10부위 형태 데이터(애니메이션 매핑의 모든 부위). 몸통 기준으로 머리·팔·다리, 팔·다리 아래 손·발이 붙는다.
+	USwarmFormDefinition* CreateGiantPoseDefinition()
+	{
+		USwarmFormDefinition* Definition = NewObject<USwarmFormDefinition>(GetTransientPackage());
+
+		auto Add = [Definition](ESwarmPartId PartId, ESwarmPartId Parent, ESwarmPrimitive Shape, const FVector& Ratio,
+			int32 Weight, const FVector& ParentAnchor, const FVector& ChildAnchor, float Gap)
+		{
+			FSwarmPartDefinition& Part = Definition->Parts.AddDefaulted_GetRef();
+			Part.PartId = PartId;
+			Part.ParentPartId = Parent;
+			Part.Shape = Shape;
+			Part.BoxHalfExtentsRatio = Ratio;
+			Part.AllocationWeight = Weight;
+			Part.ParentAnchor = ParentAnchor;
+			Part.ChildAnchor = ChildAnchor;
+			Part.Gap = Gap;
+		};
+
+		Add(ESwarmPartId::Torso, ESwarmPartId::None, ESwarmPrimitive::Box, FVector(1.0, 0.75, 1.5), 6, FVector::ZeroVector,
+			FVector::ZeroVector, 0.0f);
+		Add(ESwarmPartId::Head, ESwarmPartId::Torso, ESwarmPrimitive::Sphere, FVector(1.0), 2, FVector(0.0, 0.0, 1.0),
+			FVector(0.0, 0.0, -1.0), 5.0f);
+		Add(ESwarmPartId::LeftArm, ESwarmPartId::Torso, ESwarmPrimitive::Box, FVector(0.45, 0.45, 1.0), 2,
+			FVector(0.0, -1.0, 1.0), FVector(0.0, 1.0, 1.0), 10.0f);
+		Add(ESwarmPartId::RightArm, ESwarmPartId::Torso, ESwarmPrimitive::Box, FVector(0.45, 0.45, 1.0), 2,
+			FVector(0.0, 1.0, 1.0), FVector(0.0, -1.0, 1.0), 10.0f);
+		Add(ESwarmPartId::LeftHand, ESwarmPartId::LeftArm, ESwarmPrimitive::Box, FVector(0.6, 0.6, 1.0), 1,
+			FVector(0.0, 0.0, -1.0), FVector(0.0, 0.0, 1.0), 5.0f);
+		Add(ESwarmPartId::RightHand, ESwarmPartId::RightArm, ESwarmPrimitive::Box, FVector(0.6, 0.6, 1.0), 1,
+			FVector(0.0, 0.0, -1.0), FVector(0.0, 0.0, 1.0), 5.0f);
+		Add(ESwarmPartId::LeftLeg, ESwarmPartId::Torso, ESwarmPrimitive::Box, FVector(0.5, 0.5, 1.2), 3,
+			FVector(0.0, -0.5, -1.0), FVector(0.0, 0.0, 1.0), 5.0f);
+		Add(ESwarmPartId::RightLeg, ESwarmPartId::Torso, ESwarmPrimitive::Box, FVector(0.5, 0.5, 1.2), 3,
+			FVector(0.0, 0.5, -1.0), FVector(0.0, 0.0, 1.0), 5.0f);
+		Add(ESwarmPartId::LeftFoot, ESwarmPartId::LeftLeg, ESwarmPrimitive::Box, FVector(1.0, 0.6, 0.4), 1,
+			FVector(0.0, 0.0, -1.0), FVector(0.0, 0.0, 1.0), 3.0f);
+		Add(ESwarmPartId::RightFoot, ESwarmPartId::RightLeg, ESwarmPrimitive::Box, FVector(1.0, 0.6, 0.4), 1,
+			FVector(0.0, 0.0, -1.0), FVector(0.0, 0.0, 1.0), 3.0f);
+
+		return Definition;
+	}
+
+	// 테스트에서 PoseSource를 Time 초 포즈로 평가한다. 엔진 Tick 대신 애니메이션·뼈 변환 갱신을 직접 부른다.
+	void EvaluatePoseSourceAt(USkeletalMeshComponent& PoseSource, float Time)
+	{
+		PoseSource.SetPosition(Time, /*bFireNotifies=*/false);
+		PoseSource.TickAnimation(0.0f, /*bNeedsValidRootMotion=*/false);
+		PoseSource.RefreshBoneTransforms();
+	}
+
+	double AngleDegrees(const FQuat& A, const FQuat& B)
+	{
+		return FMath::RadiansToDegrees(A.AngularDistance(B));
+	}
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FSwarmPoseMathTest, "SwarmBoss.Stage3.PoseMath",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+// 뼈 회전 → 부모 부위 자세 변환(ComputePartPoseFromBones)을 독립적으로 만든 기대값과 비교한다.
+// 기대값은 구현 함수를 다시 부르지 않고, 알려진 축 변환(Z축 90도 보정은 X축을 Y축으로 보냄)과 벡터 회전으로 만든다.
+bool FSwarmPoseMathTest::RunTest(const FString& Parameters)
+{
+	const auto Deg = [](double Degrees) { return FMath::DegreesToRadians(Degrees); };
+	const FQuat Yaw90(FVector::UpVector, Deg(90.0));
+	const double Tolerance = 1.e-5;
+
+	// 1) 기준 자세를 그대로 넣으면 회전 없음.
+	const FQuat Reference0(FVector::UpVector, Deg(20.0));
+	const FQuat Bone0 = Reference0 * FQuat(FVector::ForwardVector, Deg(10.0));
+	const FQuat InverseRest = (Reference0.Inverse() * Bone0).Inverse();
+	TestTrue(TEXT("Calibration pose gives identity"), ASwarmBossManager::ComputePartPoseFromBones(Reference0, Bone0,
+		InverseRest, Yaw90).Equals(FQuat::Identity, Tolerance));
+
+	// 2) 기준 뼈 X축 30도 회전은 보정 C(Z축 90도) 아래에서 부모 부위 Y축 30도 회전이다. 축과 방향을 벡터로 확인한다.
+	//    Y축 30도는 아래 방향 (0, 0, -1)을 (-sin30, 0, -cos30)으로 보낸다.
+	const FQuat SingleAxis = ASwarmBossManager::ComputePartPoseFromBones(FQuat::Identity,
+		FQuat(FVector::ForwardVector, Deg(30.0)), FQuat::Identity, Yaw90);
+	TestTrue(TEXT("Single axis maps X to Y with the same angle and direction"),
+		SingleAxis.RotateVector(FVector(0.0, 0.0, -1.0)).Equals(FVector(-0.5, 0.0, -FMath::Sqrt(3.0) / 2.0), Tolerance));
+
+	// 3) 복합 회전: (X 30도 × Z 45도)는 C 아래에서 (Y 30도 × Z 45도)다(Z축은 Z축 회전에 불변).
+	const FQuat Composite = ASwarmBossManager::ComputePartPoseFromBones(FQuat::Identity,
+		FQuat(FVector::ForwardVector, Deg(30.0)) * FQuat(FVector::UpVector, Deg(45.0)), FQuat::Identity, Yaw90);
+	const FQuat ExpectedComposite = FQuat(FVector::RightVector, Deg(30.0)) * FQuat(FVector::UpVector, Deg(45.0));
+	TestTrue(TEXT("Composite rotation matches the independently built quaternion"),
+		Composite.RotateVector(FVector(1.0, 2.0, 3.0)).Equals(ExpectedComposite.RotateVector(FVector(1.0, 2.0, 3.0)), Tolerance));
+
+	// 4) 부모(기준 뼈)와 자식이 함께 돌아도 부모 회전은 자세에 들어가지 않는다.
+	const FQuat ParentTurn(FVector::UpVector, Deg(40.0));
+	const FQuat WithParent = ASwarmBossManager::ComputePartPoseFromBones(ParentTurn,
+		ParentTurn * FQuat(FVector::ForwardVector, Deg(30.0)), FQuat::Identity, Yaw90);
+	TestTrue(TEXT("Parent rotation is not applied twice"),
+		WithParent.RotateVector(FVector(0.0, 0.0, -1.0)).Equals(FVector(-0.5, 0.0, -FMath::Sqrt(3.0) / 2.0), Tolerance));
+
+	// 5) 기준 자세가 회전 없음이 아니어도(X 10도) 기준 대비 변화(X 40도 - 10도 = 30도)만 옮긴다.
+	const FQuat FromRest = ASwarmBossManager::ComputePartPoseFromBones(FQuat::Identity, FQuat(FVector::ForwardVector, Deg(40.0)),
+		FQuat(FVector::ForwardVector, Deg(10.0)).Inverse(), FQuat::Identity);
+	TestTrue(TEXT("Only the change from the calibration pose is transferred"),
+		FromRest.Equals(FQuat(FVector::ForwardVector, Deg(30.0)), Tolerance));
+
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FSwarmPoseAnimationTest, "SwarmBoss.Stage3.PoseAnimation",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+// 실제 마네킹 에셋으로 숨긴 PoseSource를 평가해 부위 자세로 옮기는 경로를 검증한다.
+// 엔진 Tick 순서(PoseSource → Manager 선행 조건)는 이 테스트에서 직접 평가를 부르므로 검증하지 않는다(에디터 Play로 확인).
+bool FSwarmPoseAnimationTest::RunTest(const FString& Parameters)
+{
+	UAnimSequence* Idle = LoadObject<UAnimSequence>(nullptr, TEXT("/Game/Characters/Mannequins/Anims/Unarmed/MM_Idle.MM_Idle"));
+	UAnimSequence* Walk = LoadObject<UAnimSequence>(nullptr,
+		TEXT("/Game/Characters/Mannequins/Anims/Unarmed/Walk/MF_Unarmed_Walk_Fwd.MF_Unarmed_Walk_Fwd"));
+	UAnimSequence* Attack = LoadObject<UAnimSequence>(nullptr,
+		TEXT("/Game/Characters/Mannequins/Anims/Unarmed/Attack/MM_Attack_01.MM_Attack_01"));
+
+	if (!TestNotNull(TEXT("Idle animation"), Idle) || !TestNotNull(TEXT("Walk animation"), Walk)
+		|| !TestNotNull(TEXT("Attack animation"), Attack))
+	{
+		return false;
+	}
+
+	UWorld* World = UWorld::CreateWorld(EWorldType::Game, false);
+
+	if (!TestNotNull(TEXT("Transient world"), World))
+	{
+		return false;
+	}
+
+	auto SpawnGiant = [World](const FRotator& Rotation)
+	{
+		ASwarmBossManager* Boss = World->SpawnActor<ASwarmBossManager>(FVector::ZeroVector, Rotation);
+
+		if (Boss)
+		{
+			Boss->SetFormDefinition(CreateGiantPoseDefinition());
+			Boss->SetAutoRebalanceOnLoss(false);
+			Boss->InitialParticleCount = 260;
+		}
+
+		return Boss;
+	};
+
+	ASwarmBossManager* Boss = SpawnGiant(FRotator::ZeroRotator);
+
+	if (!TestNotNull(TEXT("Manager"), Boss) || !TestTrue(TEXT("Generate"), Boss->GenerateInitialParts()))
+	{
+		World->DestroyWorld(false);
+		return false;
+	}
+
+	USkeletalMeshComponent& PoseSource = *Boss->PoseSource;
+	TestNotNull(TEXT("PoseSource has the mannequin mesh"), PoseSource.GetSkeletalMeshAsset());
+	AddExpectedMessage(TEXT("missing, additive, or incompatible animation"), ELogVerbosity::Warning,
+		EAutomationExpectedMessageFlags::Contains, 1, false);
+	TestFalse(TEXT("Null animation is rejected"), Boss->PlayPoseAnimation(nullptr, true));
+	TestFalse(TEXT("Rejected play does not start"), Boss->IsPoseAnimationActive());
+
+	// 1) 재생 시작 시 기준 포즈를 평가 후 캡처한다. 매핑된 9부위 모두 기준 데이터가 있어야 한다.
+	TestTrue(TEXT("Idle plays"), Boss->PlayPoseAnimation(Idle, /*bLoop=*/true));
+	TestTrue(TEXT("Calibration captured"), Boss->bPoseCalibrated);
+	TestEqual(TEXT("All nine mapped parts are calibrated"), Boss->PoseCalibration.Num(), 9);
+	TestTrue(TEXT("Playing keeps the Manager ticking"), Boss->IsActorTickEnabled());
+
+	// 2) 메시 앞 방향 확인: PoseSource Yaw 보정 뒤 Manager 공간에서 오른손이 왼손보다 +Y(오른쪽), 머리가 골반보다 위.
+	{
+		EvaluatePoseSourceAt(PoseSource, 0.0f);
+		const TArray<FTransform>& Bones = PoseSource.GetComponentSpaceTransforms();
+		const FQuat ComponentToManager = PoseSource.GetRelativeRotation().Quaternion();
+		const auto ManagerSpace = [&](const TCHAR* Bone)
+		{
+			return ComponentToManager.RotateVector(Bones[PoseSource.GetBoneIndex(Bone)].GetLocation());
+		};
+
+		TestTrue(TEXT("Mesh right side maps to Manager +Y"), ManagerSpace(TEXT("hand_r")).Y > ManagerSpace(TEXT("hand_l")).Y + 10.0);
+		TestTrue(TEXT("Mesh up stays up"), ManagerSpace(TEXT("head")).Z > ManagerSpace(TEXT("pelvis")).Z + 10.0);
+	}
+
+	// 3) 기준 포즈(Idle 0초)를 평가해 옮기면 모든 부위 자세가 회전 없음이다.
+	EvaluatePoseSourceAt(PoseSource, 0.0f);
+	Boss->UpdatePoseFromAnimation();
+	double MaxRestAngle = 0.0;
+
+	for (const FSwarmPartPoseCalibration& Calibration : Boss->PoseCalibration)
+	{
+		MaxRestAngle = FMath::Max(MaxRestAngle, AngleDegrees(Boss->GetPartPose(Calibration.PartId), FQuat::Identity));
+	}
+
+	TestTrue(TEXT("Calibration frame gives rest poses"), MaxRestAngle < 0.1);
+
+	// 4) 걷기: 여러 지정 시점에서 팔·다리 자세가 서로 달라진다(한 프레임의 비Identity 여부가 아니라 시점 간 변화).
+	TestTrue(TEXT("Walk plays"), Boss->PlayPoseAnimation(Walk, /*bLoop=*/true));
+	const float WalkLength = Walk->GetPlayLength();
+	TArray<FQuat> ArmSamples;
+	TArray<FQuat> LegSamples;
+
+	for (const float Fraction : {0.0f, 0.25f, 0.5f, 0.75f})
+	{
+		EvaluatePoseSourceAt(PoseSource, WalkLength * Fraction);
+		Boss->UpdatePoseFromAnimation();
+		ArmSamples.Add(Boss->GetPartPose(ESwarmPartId::RightArm));
+		LegSamples.Add(Boss->GetPartPose(ESwarmPartId::LeftLeg));
+	}
+
+	double ArmSpread = 0.0;
+	double LegSpread = 0.0;
+
+	for (int32 A = 0; A < ArmSamples.Num(); ++A)
+	{
+		for (int32 B = A + 1; B < ArmSamples.Num(); ++B)
+		{
+			ArmSpread = FMath::Max(ArmSpread, AngleDegrees(ArmSamples[A], ArmSamples[B]));
+			LegSpread = FMath::Max(LegSpread, AngleDegrees(LegSamples[A], LegSamples[B]));
+		}
+	}
+
+	AddInfo(FString::Printf(TEXT("Walk spread: right arm %.1f deg, left leg %.1f deg"), ArmSpread, LegSpread));
+	TestTrue(TEXT("Walk swings the arm across sample times"), ArmSpread > 5.0);
+	TestTrue(TEXT("Walk swings the leg across sample times"), LegSpread > 5.0);
+
+	// 5) Manager가 회전돼 있어도 같은 시점의 로컬 자세는 같다.
+	ASwarmBossManager* Turned = SpawnGiant(FRotator(0.0, 70.0, 0.0));
+
+	if (TestNotNull(TEXT("Turned manager"), Turned) && TestTrue(TEXT("Turned generate"), Turned->GenerateInitialParts())
+		&& TestTrue(TEXT("Turned walk plays"), Turned->PlayPoseAnimation(Walk, true)))
+	{
+		EvaluatePoseSourceAt(PoseSource, WalkLength * 0.25f);
+		Boss->UpdatePoseFromAnimation();
+		EvaluatePoseSourceAt(*Turned->PoseSource, WalkLength * 0.25f);
+		Turned->UpdatePoseFromAnimation();
+		TestTrue(TEXT("Local pose is independent of Manager world rotation"), AngleDegrees(
+			Boss->GetPartPose(ESwarmPartId::RightArm), Turned->GetPartPose(ESwarmPartId::RightArm)) < 0.01);
+	}
+
+	// 6) 재생 중 실제 재분배: 자세는 유지되고 Tick도 유지된다.
+	const FQuat ArmBeforeRebalance = Boss->GetPartPose(ESwarmPartId::RightArm);
+	UInstancedStaticMeshComponent* Torso = Boss->GetPartInstances(ESwarmPartId::Torso);
+
+	for (int32 Index = 0; Index < 15; ++Index)
+	{
+		Boss->RemoveInstance(Torso, 0);
+	}
+
+	TestTrue(TEXT("Rebalance during animation"), Boss->RebalancePartsFromDefinition());
+	TestTrue(TEXT("Pose survives rebalance"), AngleDegrees(Boss->GetPartPose(ESwarmPartId::RightArm), ArmBeforeRebalance) < 0.01);
+	TestTrue(TEXT("Animation stays active through rebalance"), Boss->IsPoseAnimationActive());
+	TestTrue(TEXT("Tick stays on through rebalance"), Boss->IsActorTickEnabled());
+
+	// 7) 공격 1회 재생: 끝나면 Idle 반복으로 돌아간다.
+	TestTrue(TEXT("Attack plays once"), Boss->PlayPoseAnimation(Attack, /*bLoop=*/false));
+	PoseSource.SetPosition(Attack->GetPlayLength() - 0.01f, false);
+	PoseSource.TickAnimation(0.1f, false);
+	PoseSource.RefreshBoneTransforms();
+	Boss->UpdatePoseFromAnimation();
+	UAnimSingleNodeInstance* Single = PoseSource.GetSingleNodeInstance();
+	TestTrue(TEXT("Finished attack returns to looping idle"),
+		Single && Single->GetAnimationAsset() == Idle && Boss->bPoseAnimationLoops);
+
+	// 8) 중지: 기본 자세로 돌아가고, 이동이 끝나면 Tick이 꺼진다. 다시 재생하면 Tick이 켜진다.
+	Boss->StopPoseAnimation();
+	TestFalse(TEXT("Stop ends animation"), Boss->IsPoseAnimationActive());
+	TestTrue(TEXT("Stop returns to rest pose"), AngleDegrees(Boss->GetPartPose(ESwarmPartId::RightArm), FQuat::Identity) < 0.01);
+	TestFalse(TEXT("Stop also stops PoseSource ticking"), PoseSource.IsComponentTickEnabled());
+
+	for (int32 Step = 0; Step < 5; ++Step)
+	{
+		Boss->Tick(Boss->ReconstructionDuration);
+	}
+
+	TestFalse(TEXT("Tick turns off when nothing is left"), Boss->IsActorTickEnabled());
+	TestTrue(TEXT("Restart plays"), Boss->PlayPoseAnimation(Idle, true));
+	TestTrue(TEXT("Restart turns Tick back on"), Boss->IsActorTickEnabled());
 
 	World->DestroyWorld(false);
 	return true;

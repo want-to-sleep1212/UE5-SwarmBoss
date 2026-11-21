@@ -6,10 +6,29 @@
 #include "Swarm/SwarmShapeSampler.h"
 #include "SwarmBossManager.generated.h"
 
+class UAnimSequence;
 class UInstancedStaticMeshComponent;
 class UPrimitiveComponent;
+class USkeletalMesh;
+class USkeletalMeshComponent;
 class UStaticMesh;
 class USwarmFormDefinition;
+
+// 애니메이션 자세 전달에 쓰는 부위 하나의 기준 데이터. CapturePoseCalibration()이 기준 애니메이션 0초 포즈에서 만든다.
+struct FSwarmPartPoseCalibration
+{
+	ESwarmPartId PartId = ESwarmPartId::None;
+
+	// 부위 뼈 B와 기준 뼈 P의 PoseSource 뼈 번호.
+	int32 BoneIndex = INDEX_NONE;
+	int32 ReferenceBoneIndex = INDEX_NONE;
+
+	// 기준 자세의 상대 회전의 역 L0⁻¹ = (P0⁻¹ × B0)⁻¹.
+	FQuat InverseRestRelative = FQuat::Identity;
+
+	// 기준 뼈 좌표계 → 거인 부모 부위 좌표계 보정 C = G0⁻¹ × M × P0. 기준 자세에서 한 번 계산하고 매 프레임 다시 계산하지 않는다.
+	FQuat FrameCorrection = FQuat::Identity;
+};
 
 // 초기 생성할 부위와 해당 ISM 컴포넌트 기준의 구체 중심 좌표 목록.
 struct FSwarmPartPlacement
@@ -111,8 +130,27 @@ public:
 	// 거부 조건과 실패 시 동작은 SetPartPose()와 같다.
 	bool AddPartPoseDelta(ESwarmPartId PartId, const FQuat& Delta);
 
+	// 쿼터니언 절대 자세 지정. 애니메이션 경로처럼 매 프레임 절대 자세를 줄 때 쓴다. 거부 조건은 SetPartPose(FRotator)와 같다.
+	bool SetPartPose(ESwarmPartId PartId, const FQuat& Rotation);
+
 	// PartId 부위의 현재 자세. 없는 부위는 회전 없음을 반환한다.
 	FQuat GetPartPose(ESwarmPartId PartId) const;
+
+	// 숨긴 PoseSource에서 Animation을 단일 애니메이션으로 재생하고, 매 Tick 평가된 뼈 회전을 부위 자세로 옮긴다.
+	// 처음이거나 메시·기준 애니메이션·부위 구성이 바뀌었으면 기준 포즈를 먼저 캡처하며, 실패하면 재생하지 않고 false를 반환한다.
+	// 비가산 일반 UAnimSequence만 받으며 PoseSource 메시와 스켈레톤이 같아야 한다. bLoop가 false면 끝난 뒤 ReturnPoseAnimation을 반복 재생한다.
+	bool PlayPoseAnimation(UAnimSequence* Animation, bool bLoop);
+
+	// 애니메이션 자세 전달을 멈추고 PoseSource 평가도 멈춘 뒤 모든 부위 자세를 기본 자세(회전 없음)로 되돌린다.
+	void StopPoseAnimation();
+
+	// 애니메이션 자세 전달 중이면 true. 이때 1~4 키 같은 수동 자세는 매 프레임 덮어써진다.
+	bool IsPoseAnimationActive() const { return bAnimatingPose; }
+
+	// 기준 뼈 회전 P·부위 뼈 회전 B(같은 PoseSource 컴포넌트 공간)를 부모 부위 로컬 자세로 바꾼다. 엔진 상태와 무관한 순수 계산이다.
+	// D = (P⁻¹ × B) × L0⁻¹(기준 자세 대비 변화, 기준 뼈 좌표계), Q = (C × D × C⁻¹).GetNormalized().
+	static FQuat ComputePartPoseFromBones(const FQuat& ReferenceBone, const FQuat& Bone, const FQuat& InverseRestRelative,
+		const FQuat& FrameCorrection);
 
 	// 모든 부위의 현재 도형(반크기 + 구체 반지름)을 감싸는 월드 AABB. 구체가 없으면 유효하지 않은 상자를 반환한다.
 	// 피해 구간을 연 투사체가 보스를 벗어났는지 판단할 때 쓴다. 구체를 하나씩 보지 않으므로 부위 수만큼만 계산한다.
@@ -128,6 +166,7 @@ private:
 	friend class FSwarmNeighborTransferTest;
 	friend class FSwarmAutoRebalanceTest;
 	friend class FSwarmJointPoseTest;
+	friend class FSwarmPoseAnimationTest;
 
 	// 재구성 목표를 배정한 시점부터 도착까지의 게임 시간(초). 변경한 값은 다음 목표 배정부터 적용한다.
 	UPROPERTY(EditAnywhere, Category="Swarm|Movement", meta=(ClampMin="0.01", UIMin="0.01", Units="s"))
@@ -145,7 +184,21 @@ private:
 	FVector GetJointWorldLocation(ESwarmPartId FirstPartId, ESwarmPartId SecondPartId) const;
 
 	// Part의 자세 검사를 마친 Pose를 저장하고, 그 부위 ISM의 상대 위치·회전 하나만 다시 설정한다. 자식 부위는 부착 계층으로 따라 돈다.
-	bool ApplyPartPose(FSwarmPart& Part, const FQuat& Pose);
+	// bLog가 false면 호출별 로그를 남기지 않는다(애니메이션처럼 매 프레임 부르는 경로는 1초 집계 로그를 쓴다).
+	bool ApplyPartPose(FSwarmPart& Part, const FQuat& Pose, bool bLog = true);
+
+	// 부모 ISM 기준 상대 변환(부위 정의·현재 도형 크기, bWithPose면 저장된 자세 포함).
+	FTransform ComputePartRelative(const FSwarmPart& Part, bool bWithPose) const;
+
+	// 자세를 모두 뺀 기본 자세에서 부위 로컬 → Manager 루트 변환. 부모를 따라 재귀로 누적한다(자식상대 * 부모→루트).
+	FTransform ComputeRestToRoot(ESwarmPartId PartId) const;
+
+	// 기준 애니메이션 0초 포즈를 PoseSource에서 동기로 평가한 뒤 부위마다 기준 데이터를 만든다. 필요한 뼈가 없거나
+	// 메시·애니메이션이 맞지 않으면 경고를 남기고 false를 반환한다(기준 데이터 없이는 자세 전달을 시작하지 않는다).
+	bool CapturePoseCalibration();
+
+	// 이번 프레임 평가가 끝난 PoseSource 뼈 회전을 읽어 부위마다 절대 자세로 적용한다. 1회 재생이 끝났으면 복귀 애니메이션으로 바꾼다.
+	void UpdatePoseFromAnimation();
 	TArray<int32> SelectParticlesNearest(ESwarmPartId PartId, const FVector& WorldPoint, int32 MaxCount,
 		const TSet<int32>& ExcludedParticleIds) const;
 
@@ -206,4 +259,44 @@ private:
 	// 모든 부위 ISM에 지정할 구체 메시(/Engine/BasicShapes/Sphere).
 	UPROPERTY()
 	TObjectPtr<UStaticMesh> SphereMesh;
+
+	// 애니메이션을 평가만 하는 숨긴 스켈레탈 메시. 화면에 보이지 않아도 뼈를 갱신하고, 재생 중에만 Tick한다.
+	UPROPERTY(VisibleAnywhere, Category="Swarm|Animation")
+	TObjectPtr<USkeletalMeshComponent> PoseSource;
+
+	// PoseSource에 쓸 마네킹 메시. 바꾸면 다음 재생 때 기준 포즈를 다시 캡처한다.
+	UPROPERTY(EditAnywhere, Category="Swarm|Animation")
+	TObjectPtr<USkeletalMesh> PoseSourceMesh;
+
+	// 기준 자세 애니메이션. 0초 포즈를 거인 기본 자세에 대응시킨다(서 있는 자세 = 거인 기본 자세).
+	UPROPERTY(EditAnywhere, Category="Swarm|Animation")
+	TObjectPtr<UAnimSequence> CalibrationAnimation;
+
+	// 1회 재생 애니메이션(공격 등)이 끝난 뒤 반복 재생할 애니메이션.
+	UPROPERTY(EditAnywhere, Category="Swarm|Animation")
+	TObjectPtr<UAnimSequence> ReturnPoseAnimation;
+
+	// PoseSource 컴포넌트의 Yaw(도). 마네킹 메시는 컴포넌트 공간 +Y가 앞이라 -90도로 Manager 앞(+X)에 맞춘다(PoseAnimation 테스트에서 확인).
+	UPROPERTY(EditAnywhere, Category="Swarm|Animation")
+	float PoseSourceYaw = -90.0f;
+
+	bool bAnimatingPose = false;
+	bool bPoseAnimationLoops = true;
+
+	// 지금 재생 중인 애니메이션(1회 재생이 끝났는지 길이로 판단할 때 쓴다).
+	TWeakObjectPtr<UAnimSequence> CurrentPoseAnimation;
+	bool bPoseCalibrated = false;
+	TArray<FSwarmPartPoseCalibration> PoseCalibration;
+
+	// 기준 데이터를 만든 조건. 바뀌면 다시 캡처한다(비교용이라 약한 참조).
+	TWeakObjectPtr<USkeletalMesh> CalibratedMesh;
+	TWeakObjectPtr<UAnimSequence> CalibratedAnimation;
+
+	// 측정용 1초 집계: 한 프레임 전체 부위 기준 뼈 읽기·변환 시간과 ISM 자세 적용 시간(ms). PoseSource 평가 비용은 포함하지 않는다.
+	int32 PoseFrames = 0;
+	double PoseComputeTotalMs = 0.0;
+	double PoseComputeMaxMs = 0.0;
+	double PoseApplyTotalMs = 0.0;
+	double PoseApplyMaxMs = 0.0;
+	double PoseLogStartTime = -1.0;
 };

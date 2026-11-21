@@ -44,6 +44,7 @@ Desktop.ini
 /Content/**
 !/Content/**/
 !/Content/Characters/Mannequins/Anims/Unarmed/ABP_Unarmed.uasset
+!/Content/Characters/Mannequins/Anims/Unarmed/Attack/MM_Attack_01.uasset
 !/Content/Characters/Mannequins/Anims/Unarmed/BS_Idle_Walk_Run.uasset
 !/Content/Characters/Mannequins/Anims/Unarmed/Jog/MF_Unarmed_Jog_Bwd.uasset
 !/Content/Characters/Mannequins/Anims/Unarmed/Jog/MF_Unarmed_Jog_Bwd_Left.uasset

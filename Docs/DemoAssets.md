@@ -24,6 +24,7 @@
 
 | 에셋 | 추가일 | 추적 이유 |
 |---|---|---|
+| `/Game/Characters/Mannequins/Anims/Unarmed/Attack/MM_Attack_01` | 2026-11-17 | 5 키 애니메이션 자세 전달의 공격(PlayerController `AttackAnimation` 기본값). 스켈레톤 `SK_Mannequin`은 이미 추적 중이다. 패키지에 미리보기 메시 `SKM_Manny`와 `LS_Attack_01` 이름이 남아 있으나 로컬에 없는 에디터용 참조로 보이며, 자동 테스트 로드·평가에는 문제가 없었다. 함께 쓰는 `SKM_Manny_Simple`, `MM_Idle`, `MF_Unarmed_Walk_Fwd`는 이미 추적 중이다. |
 | `/Game/Data/DA_GiantForm` (`Content/Data/DA_GiantForm.uasset`) | 2026-11-14 | `SwarmBossManager`의 `Form Definition`에 지정하는 거인 형태 데이터. 비어 있으면 Manager가 구체를 생성하지 않는다. `/Script` 클래스 외 다른 Content 의존은 없다. |
 
 `DA_GiantForm`은 Asset Registry 재귀 조사로 찾은 것이 아니라 허용 목록에 직접 추가했다. 레벨에 배치한 `SwarmBossManager` 외부 Actor 파일은 허용 목록에 없어 추적하지 않으므로, 추적 중인 레벨 파일은 이 에셋을 참조하지 않는다. 새로 받은 저장소에서는 Manager를 배치하고 이 에셋을 지정해야 한다. [DemoAssetDependencies.json](DemoAssetDependencies.json)은 2026-11-10 조사 결과이며 이번 추가로 다시 생성하지 않았다.

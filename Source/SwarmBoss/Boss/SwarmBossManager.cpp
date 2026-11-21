@@ -1,6 +1,9 @@
 #include "SwarmBossManager.h"
 
+#include "Animation/AnimSequence.h"
 #include "Components/InstancedStaticMeshComponent.h"
+#include "Components/SkeletalMeshComponent.h"
+#include "Engine/SkeletalMesh.h"
 #include "Components/SceneComponent.h"
 #include "Engine/StaticMesh.h"
 #include "Boss/SwarmFormDefinition.h"
@@ -120,6 +123,28 @@ namespace
 		return FTransform(Pose * RestRotation, Pivot + Pose.RotateVector(RestLocation - Pivot));
 	}
 
+	// 부위 → (부위 뼈, 기준 뼈). 기준 뼈는 부모 부위의 뼈와 다를 수 있다(다리는 허리를 굽혀도 따라 돌지 않게 pelvis 기준).
+	// 팔·다리는 한 덩어리라 팔꿈치·무릎 굽힘의 회전은 손·발 방향에만 반영되고, 그에 따른 손·발 위치 변화는 재현되지 않는다.
+	// 즉 애니메이션의 손·발 궤적이 아니라 부위별 회전 변화를 옮기는 근사다. 몸통(최상위)은 자세를 받지 않는다.
+	struct FPartBoneMapping
+	{
+		ESwarmPartId PartId;
+		const TCHAR* Bone;
+		const TCHAR* ReferenceBone;
+	};
+
+	constexpr FPartBoneMapping PartBoneMappings[] = {
+		{ESwarmPartId::Head, TEXT("head"), TEXT("spine_05")},
+		{ESwarmPartId::LeftArm, TEXT("upperarm_l"), TEXT("spine_05")},
+		{ESwarmPartId::RightArm, TEXT("upperarm_r"), TEXT("spine_05")},
+		{ESwarmPartId::LeftHand, TEXT("hand_l"), TEXT("upperarm_l")},
+		{ESwarmPartId::RightHand, TEXT("hand_r"), TEXT("upperarm_r")},
+		{ESwarmPartId::LeftLeg, TEXT("thigh_l"), TEXT("pelvis")},
+		{ESwarmPartId::RightLeg, TEXT("thigh_r"), TEXT("pelvis")},
+		{ESwarmPartId::LeftFoot, TEXT("foot_l"), TEXT("thigh_l")},
+		{ESwarmPartId::RightFoot, TEXT("foot_r"), TEXT("thigh_r")},
+	};
+
 	// 자세가 쓸 수 있는 회전인지(NaN·무한대가 아니고 정규화할 수 있는지) 확인한다.
 	bool IsValidPose(const FQuat& Pose)
 	{
@@ -164,6 +189,37 @@ ASwarmBossManager::ASwarmBossManager()
 	if (Sphere.Succeeded())
 	{
 		SphereMesh = Sphere.Object;
+	}
+
+	// 애니메이션 평가 전용 숨긴 스켈레탈 메시. 보이지 않아도 뼈를 갱신하도록(AlwaysTickPoseAndRefreshBones) 하고,
+	// 갱신 빈도 최적화(URO)로 평가를 건너뛰지 않게 끈다. LOD 0을 고정해 필요한 뼈가 빠지지 않게 한다. 재생 중에만 Tick한다.
+	PoseSource = CreateDefaultSubobject<USkeletalMeshComponent>(TEXT("PoseSource"));
+	PoseSource->SetupAttachment(BossRoot);
+	PoseSource->SetHiddenInGame(true);
+	PoseSource->SetVisibility(false);
+	PoseSource->SetCollisionEnabled(ECollisionEnabled::NoCollision);
+	PoseSource->SetGenerateOverlapEvents(false);
+	PoseSource->SetCastShadow(false);
+	PoseSource->VisibilityBasedAnimTickOption = EVisibilityBasedAnimTickOption::AlwaysTickPoseAndRefreshBones;
+	PoseSource->bEnableUpdateRateOptimizations = false;
+	PoseSource->SetForcedLOD(1);
+	PoseSource->PrimaryComponentTick.bStartWithTickEnabled = false;
+	PoseSource->SetRelativeRotation(FRotator(0.0, PoseSourceYaw, 0.0));
+
+	static ConstructorHelpers::FObjectFinder<USkeletalMesh> Manny(
+		TEXT("/Game/Characters/Mannequins/Meshes/SKM_Manny_Simple.SKM_Manny_Simple"));
+	static ConstructorHelpers::FObjectFinder<UAnimSequence> Idle(TEXT("/Game/Characters/Mannequins/Anims/Unarmed/MM_Idle.MM_Idle"));
+
+	if (Manny.Succeeded())
+	{
+		PoseSourceMesh = Manny.Object;
+		PoseSource->SetSkeletalMeshAsset(Manny.Object);
+	}
+
+	if (Idle.Succeeded())
+	{
+		CalibrationAnimation = Idle.Object;
+		ReturnPoseAnimation = Idle.Object;
 	}
 }
 
@@ -288,28 +344,12 @@ void ASwarmBossManager::ApplyPartPlacement(bool bPreserveParticleWorldPositions)
 		}
 	}
 
-	// 부모 ISM 기준 상대 변환을 부위 정의·현재 도형 크기·저장된 자세로 계산한다. bWithPose가 false면 자세를 빼고 기본 자세로 계산한다.
-	auto ComputeRelative = [this](const FSwarmPart& Part, bool bWithPose)
-	{
-		const FSwarmPartDefinition& Definition = Part.Definition;
-
-		if (Definition.ParentPartId == ESwarmPartId::None)
-		{
-			return FTransform(Definition.RelativeRotation.Quaternion());
-		}
-
-		const FSwarmPart& Parent = Parts.FindChecked(Definition.ParentPartId);
-		return ComputeChildRelativeTransform(Definition, Part.HalfExtents, Part.SamplingSettings.ParticleRadius,
-			Parent.Definition.Shape, Parent.HalfExtents, Parent.SamplingSettings.ParticleRadius,
-			bWithPose ? Part.Pose : FQuat::Identity);
-	};
-
 	FSwarmPart* RootPart = nullptr;
 
 	for (TPair<ESwarmPartId, FSwarmPart>& Pair : Parts)
 	{
 		FSwarmPart& Part = Pair.Value;
-		const FTransform Relative = ComputeRelative(Part, /*bWithPose=*/true);
+		const FTransform Relative = ComputePartRelative(Part, /*bWithPose=*/true);
 		Part.Instances->SetRelativeLocationAndRotation(Relative.GetLocation(), Relative.GetRotation());
 
 		if (Part.Definition.ParentPartId == ESwarmPartId::None)
@@ -318,28 +358,7 @@ void ASwarmBossManager::ApplyPartPlacement(bool bPreserveParticleWorldPositions)
 		}
 	}
 
-	// 바닥은 자세를 뺀 기본 자세로 계산해, 같은 도형 크기에서는 팔·다리를 돌려도 몸 높이가 바뀌지 않게 한다.
-	// 실제 컴포넌트 위치를 읽지 않고, 부위마다 자세 없는 상대 변환을 부모 쪽으로 누적해 루트 기준 변환을 구한다.
-	// - 모든 조상의 자세를 빼고 각 부위의 기본 회전(RelativeRotation)은 넣는다.
-	// - 최상위 부위의 높이 보정은 넣지 않는다(최상위는 루트 중심·기본 회전만).
-	// - TMap 순회 순서와 무관하게 부모를 따라 재귀로 누적한다. FTransform 곱 A * B는 A를 먼저 적용하므로 자식상대 * 부모→루트다.
-	TMap<ESwarmPartId, FTransform> RestToRoot;
-	TFunction<FTransform(ESwarmPartId)> GetRestToRoot = [&](ESwarmPartId PartId) -> FTransform
-	{
-		if (const FTransform* Cached = RestToRoot.Find(PartId))
-		{
-			return *Cached;
-		}
-
-		const FSwarmPart& Part = Parts.FindChecked(PartId);
-		const FTransform Relative = ComputeRelative(Part, /*bWithPose=*/false);
-		const FTransform ToRoot = Part.Definition.ParentPartId == ESwarmPartId::None
-			? Relative : Relative * GetRestToRoot(Part.Definition.ParentPartId);
-
-		RestToRoot.Add(PartId, ToRoot);
-		return ToRoot;
-	};
-
+	// 바닥은 자세를 뺀 기본 자세(ComputeRestToRoot)로 계산해, 같은 도형 크기에서는 팔·다리를 돌려도 몸 높이가 바뀌지 않게 한다.
 	double LowestZ = TNumericLimits<double>::Max();
 
 	for (TPair<ESwarmPartId, FSwarmPart>& Pair : Parts)
@@ -353,7 +372,7 @@ void ASwarmBossManager::ApplyPartPlacement(bool bPreserveParticleWorldPositions)
 		}
 
 		LowestZ = FMath::Min(LowestZ, GetLowestZ(Part.Definition.Shape, Part.HalfExtents,
-			Part.SamplingSettings.ParticleRadius, GetRestToRoot(Pair.Key)));
+			Part.SamplingSettings.ParticleRadius, ComputeRestToRoot(Pair.Key)));
 	}
 
 	// 가장 낮은 기본 자세 구체 표면이 Manager 루트 높이(Z=0)에 오도록 최상위 부위만 올린다. 자식 ISM은 붙어 있어 함께 올라간다.
@@ -429,6 +448,12 @@ void ASwarmBossManager::BeginPlay()
 {
 	Super::BeginPlay();
 
+	// PoseSource의 애니메이션 평가(병렬 평가 완료 포함)가 끝난 뒤 Manager Tick이 뼈를 읽도록 순서를 건다.
+	if (PoseSource)
+	{
+		AddTickPrerequisiteComponent(PoseSource);
+	}
+
 	GenerateInitialParts();
 }
 
@@ -501,6 +526,20 @@ bool ASwarmBossManager::GenerateInitialParts()
 	for (TPair<ESwarmPartId, FSwarmPart>& Pair : Parts)
 	{
 		Pair.Value.Pose = FQuat::Identity;
+	}
+
+	// 부위 구성이 바뀌었을 수 있으므로 애니메이션 기준 데이터를 다시 만들게 한다. 재생 중이었다면 멈춘다.
+	bPoseCalibrated = false;
+
+	if (bAnimatingPose)
+	{
+		bAnimatingPose = false;
+
+		if (PoseSource)
+		{
+			PoseSource->Stop();
+			PoseSource->SetComponentTickEnabled(false);
+		}
 	}
 
 	if (!InitializeParticles(Placements, TorsoSettings.ParticleRadius))
@@ -1561,6 +1600,12 @@ void ASwarmBossManager::Tick(float DeltaTime)
 		}
 	}
 
+	// PoseSource 평가가 끝난 이번 프레임 뼈 회전으로 부위 자세를 먼저 맞춘다(Tick 선행 조건으로 평가 완료 보장).
+	if (bAnimatingPose)
+	{
+		UpdatePoseFromAnimation();
+	}
+
 	const double MovementStart = FPlatformTime::Seconds();
 	const bool bStillMoving = UpdateParticleMovement(DeltaTime);
 	const double MovementMs = (FPlatformTime::Seconds() - MovementStart) * 1000.0;
@@ -1583,7 +1628,8 @@ void ASwarmBossManager::Tick(float DeltaTime)
 		MovementMaxMs = 0.0;
 	}
 
-	if (!bStillMoving && !bRebalancePending)
+	// 애니메이션 자세 전달 중이거나, 이동·재분배가 남아 있으면 Tick을 유지한다.
+	if (!bStillMoving && !bRebalancePending && !bAnimatingPose)
 	{
 		SetActorTickEnabled(false);
 	}
@@ -1634,6 +1680,12 @@ bool ASwarmBossManager::AddPartPoseDelta(ESwarmPartId PartId, const FQuat& Delta
 	return ApplyPartPose(*Part, (Delta.GetNormalized() * Part->Pose).GetNormalized());
 }
 
+bool ASwarmBossManager::SetPartPose(ESwarmPartId PartId, const FQuat& Rotation)
+{
+	FSwarmPart* Part = Parts.Find(PartId);
+	return Part && IsValidPose(Rotation) && ApplyPartPose(*Part, Rotation);
+}
+
 FQuat ASwarmBossManager::GetPartPose(ESwarmPartId PartId) const
 {
 	const FSwarmPart* Part = Parts.Find(PartId);
@@ -1643,7 +1695,7 @@ FQuat ASwarmBossManager::GetPartPose(ESwarmPartId PartId) const
 // 최상위 부위·잘못된 회전·ISM 없음은 거부하고 기존 자세를 유지한다. 통과하면 자세를 저장하고 이 부위 ISM 하나의 상대 변환만 설정한다.
 // 자식 부위는 부착 계층으로 함께 돌고, 구체·목표는 부위 로컬이라 함께 돈다. 바닥 높이는 기본 자세 기준이라 다시 계산하지 않는다.
 // 측정: 이 호출의 동기 실행 시간만 잰다. 자식 ISM 변환 전파 같은 엔진 내부 비용이 포함되지만, 프레임 전체 비용은 따로 확인해야 한다.
-bool ASwarmBossManager::ApplyPartPose(FSwarmPart& Part, const FQuat& Pose)
+bool ASwarmBossManager::ApplyPartPose(FSwarmPart& Part, const FQuat& Pose, bool bLog)
 {
 	TRACE_CPUPROFILER_EVENT_SCOPE(Swarm_ApplyPose);
 
@@ -1666,9 +1718,270 @@ bool ASwarmBossManager::ApplyPartPose(FSwarmPart& Part, const FQuat& Pose)
 		Parent->SamplingSettings.ParticleRadius, Part.Pose);
 	Part.Instances->SetRelativeLocationAndRotation(Relative.GetLocation(), Relative.GetRotation());
 
-	UE_LOG(LogSwarmBossManager, Display, TEXT("Pose %s: %s Time=%.2fms"), *UEnum::GetValueAsString(Part.Definition.PartId),
-		*Part.Pose.Rotator().ToString(), (FPlatformTime::Seconds() - Start) * 1000.0);
+	if (bLog)
+	{
+		UE_LOG(LogSwarmBossManager, Display, TEXT("Pose %s: %s Time=%.2fms"), *UEnum::GetValueAsString(Part.Definition.PartId),
+			*Part.Pose.Rotator().ToString(), (FPlatformTime::Seconds() - Start) * 1000.0);
+	}
+
 	return true;
+}
+
+// 최상위는 루트 중심·기본 회전만, 자식은 ComputeChildRelativeTransform(저장된 자세 또는 회전 없음).
+FTransform ASwarmBossManager::ComputePartRelative(const FSwarmPart& Part, bool bWithPose) const
+{
+	const FSwarmPartDefinition& Definition = Part.Definition;
+
+	if (Definition.ParentPartId == ESwarmPartId::None)
+	{
+		return FTransform(Definition.RelativeRotation.Quaternion());
+	}
+
+	const FSwarmPart& Parent = Parts.FindChecked(Definition.ParentPartId);
+	return ComputeChildRelativeTransform(Definition, Part.HalfExtents, Part.SamplingSettings.ParticleRadius,
+		Parent.Definition.Shape, Parent.HalfExtents, Parent.SamplingSettings.ParticleRadius,
+		bWithPose ? Part.Pose : FQuat::Identity);
+}
+
+// 실제 컴포넌트 위치를 읽지 않고 자세 없는 상대 변환을 부모 쪽으로 누적한다.
+// - 모든 조상의 자세를 빼고 각 부위의 기본 회전(RelativeRotation)은 넣는다.
+// - 최상위 부위의 높이 보정은 넣지 않는다(최상위는 루트 중심·기본 회전만).
+// - TMap 순회 순서와 무관하게 부모를 따라 재귀로 누적한다. FTransform 곱 A * B는 A를 먼저 적용하므로 자식상대 * 부모→루트다.
+FTransform ASwarmBossManager::ComputeRestToRoot(ESwarmPartId PartId) const
+{
+	const FSwarmPart& Part = Parts.FindChecked(PartId);
+	const FTransform Relative = ComputePartRelative(Part, /*bWithPose=*/false);
+
+	return Part.Definition.ParentPartId == ESwarmPartId::None
+		? Relative : Relative * ComputeRestToRoot(Part.Definition.ParentPartId);
+}
+
+// L = P⁻¹ × B는 기준 뼈 좌표계에서 본 부위 뼈의 회전이라, 부모 쪽 회전(P)이 바뀌어도 그대로다(부모 회전 이중 적용 없음).
+// D = L × L0⁻¹는 기준 자세 대비 변화이고, C로 거인 부모 부위 좌표계에 옮긴다.
+FQuat ASwarmBossManager::ComputePartPoseFromBones(const FQuat& ReferenceBone, const FQuat& Bone,
+	const FQuat& InverseRestRelative, const FQuat& FrameCorrection)
+{
+	const FQuat Relative = ReferenceBone.Inverse() * Bone;
+	const FQuat Delta = Relative * InverseRestRelative;
+	return (FrameCorrection * Delta * FrameCorrection.Inverse()).GetNormalized();
+}
+
+// 1) 메시·기준 애니메이션이 맞는지 검사한다(비가산 일반 UAnimSequence, 같은 스켈레톤).
+// 2) PoseSource를 기준 애니메이션 0초로 맞추고 애니메이션·뼈 변환을 동기로 한 번 평가한다(지정만으로는 뼈 배열이 바뀌지 않음).
+// 3) 부위마다 B0·P0(컴포넌트 공간)로 L0⁻¹과 C = G0⁻¹ × M × P0를 저장한다.
+//    M = PoseSource 컴포넌트 공간 → Manager 공간 회전(PoseSource의 상대 회전, Yaw 보정 포함). 뼈는 컴포넌트 공간에서 읽어
+//    Yaw 보정을 M에서 한 번만 반영한다. G0 = 거인 부모 부위의 기본 자세 회전(부모까지 전체 계층, ComputeRestToRoot).
+// 필요한 뼈가 하나라도 없으면 실패한다. 이 함수는 초기화 단계(재생 시작 전)에서만 부른다.
+bool ASwarmBossManager::CapturePoseCalibration()
+{
+	TRACE_CPUPROFILER_EVENT_SCOPE(Swarm_CapturePoseCalibration);
+	bPoseCalibrated = false;
+	PoseCalibration.Reset();
+
+	if (!PoseSource || !PoseSourceMesh || !CalibrationAnimation)
+	{
+		UE_LOG(LogSwarmBossManager, Warning, TEXT("Pose calibration on %s needs PoseSourceMesh and CalibrationAnimation."), *GetName());
+		return false;
+	}
+
+	if (CalibrationAnimation->IsValidAdditive() || CalibrationAnimation->GetSkeleton() != PoseSourceMesh->GetSkeleton())
+	{
+		UE_LOG(LogSwarmBossManager, Warning, TEXT("Calibration animation %s is additive or uses another skeleton."),
+			*CalibrationAnimation->GetName());
+		return false;
+	}
+
+	PoseSource->SetRelativeRotation(FRotator(0.0, PoseSourceYaw, 0.0));
+
+	if (PoseSource->GetSkeletalMeshAsset() != PoseSourceMesh)
+	{
+		PoseSource->SetSkeletalMeshAsset(PoseSourceMesh);
+	}
+
+	PoseSource->SetAnimationMode(EAnimationMode::AnimationSingleNode);
+	PoseSource->SetAnimation(CalibrationAnimation);
+	PoseSource->SetPosition(0.0f, /*bFireNotifies=*/false);
+	PoseSource->TickAnimation(0.0f, /*bNeedsValidRootMotion=*/false);
+	PoseSource->RefreshBoneTransforms();
+
+	const TArray<FTransform>& Bones = PoseSource->GetComponentSpaceTransforms();
+
+	if (Bones.IsEmpty())
+	{
+		UE_LOG(LogSwarmBossManager, Warning, TEXT("Pose calibration on %s: PoseSource has no evaluated bones."), *GetName());
+		return false;
+	}
+
+	const FQuat ComponentToManager = PoseSource->GetRelativeRotation().Quaternion();
+
+	for (const FPartBoneMapping& Mapping : PartBoneMappings)
+	{
+		const FSwarmPart* Part = Parts.Find(Mapping.PartId);
+
+		if (!Part || Part->Definition.ParentPartId == ESwarmPartId::None)
+		{
+			continue;
+		}
+
+		FSwarmPartPoseCalibration Calibration;
+		Calibration.PartId = Mapping.PartId;
+		Calibration.BoneIndex = PoseSource->GetBoneIndex(Mapping.Bone);
+		Calibration.ReferenceBoneIndex = PoseSource->GetBoneIndex(Mapping.ReferenceBone);
+
+		if (!Bones.IsValidIndex(Calibration.BoneIndex) || !Bones.IsValidIndex(Calibration.ReferenceBoneIndex))
+		{
+			UE_LOG(LogSwarmBossManager, Warning, TEXT("Pose calibration on %s: bone %s or %s is missing in %s."), *GetName(),
+				Mapping.Bone, Mapping.ReferenceBone, *PoseSourceMesh->GetName());
+			PoseCalibration.Reset();
+			return false;
+		}
+
+		const FQuat Bone0 = Bones[Calibration.BoneIndex].GetRotation();
+		const FQuat Reference0 = Bones[Calibration.ReferenceBoneIndex].GetRotation();
+		const FQuat ParentRest = ComputeRestToRoot(Part->Definition.ParentPartId).GetRotation();
+
+		Calibration.InverseRestRelative = (Reference0.Inverse() * Bone0).Inverse();
+		Calibration.FrameCorrection = (ParentRest.Inverse() * ComponentToManager * Reference0).GetNormalized();
+		PoseCalibration.Add(Calibration);
+	}
+
+	CalibratedMesh = PoseSourceMesh;
+	CalibratedAnimation = CalibrationAnimation;
+	bPoseCalibrated = true;
+	UE_LOG(LogSwarmBossManager, Display, TEXT("Pose calibration on %s: %d parts from %s at 0s."), *GetName(),
+		PoseCalibration.Num(), *CalibrationAnimation->GetName());
+	return true;
+}
+
+bool ASwarmBossManager::PlayPoseAnimation(UAnimSequence* Animation, bool bLoop)
+{
+	if (!Animation || !PoseSource || !PoseSourceMesh || Animation->IsValidAdditive()
+		|| Animation->GetSkeleton() != PoseSourceMesh->GetSkeleton())
+	{
+		UE_LOG(LogSwarmBossManager, Warning, TEXT("PlayPoseAnimation on %s: missing, additive, or incompatible animation."),
+			*GetName());
+		return false;
+	}
+
+	const bool bCalibrationStale = !bPoseCalibrated || CalibratedMesh.Get() != PoseSourceMesh
+		|| CalibratedAnimation.Get() != CalibrationAnimation;
+
+	if (bCalibrationStale && !CapturePoseCalibration())
+	{
+		return false;
+	}
+
+	// 단일 애니메이션 재생(AnimationSingleNode). 클립을 바꾸면 블렌딩 없이 즉시 바뀐다(AnimBP 전환은 후속 작업).
+	PoseSource->SetComponentTickEnabled(true);
+	PoseSource->PlayAnimation(Animation, bLoop);
+	bPoseAnimationLoops = bLoop;
+	CurrentPoseAnimation = Animation;
+	bAnimatingPose = true;
+	PoseFrames = 0;
+	PoseComputeTotalMs = PoseComputeMaxMs = PoseApplyTotalMs = PoseApplyMaxMs = 0.0;
+	PoseLogStartTime = -1.0;
+	SetActorTickEnabled(true);
+
+	UE_LOG(LogSwarmBossManager, Display, TEXT("Pose animation on %s: %s Loop=%d"), *GetName(), *Animation->GetName(),
+		bLoop ? 1 : 0);
+	return true;
+}
+
+// 자세 전달과 PoseSource 평가를 멈추고 기본 자세로 되돌린다. Tick은 이동·재분배가 남았으면 Tick 쪽 조건이 유지한다.
+void ASwarmBossManager::StopPoseAnimation()
+{
+	bAnimatingPose = false;
+
+	if (PoseSource)
+	{
+		PoseSource->Stop();
+		PoseSource->SetComponentTickEnabled(false);
+	}
+
+	for (TPair<ESwarmPartId, FSwarmPart>& Pair : Parts)
+	{
+		if (Pair.Value.Definition.ParentPartId != ESwarmPartId::None)
+		{
+			ApplyPartPose(Pair.Value, FQuat::Identity, /*bLog=*/false);
+		}
+	}
+}
+
+// 매 Tick 절대 자세로 설정한다(이전 프레임 자세에 누적하지 않음). 시간은 한 프레임 전체 부위 기준으로 1초마다 집계한다.
+// 측정에 PoseSource 애니메이션 평가 비용은 들어가지 않는다(Tick 선행 조건으로 먼저 끝남, Insights로 따로 확인).
+void ASwarmBossManager::UpdatePoseFromAnimation()
+{
+	TRACE_CPUPROFILER_EVENT_SCOPE(Swarm_UpdatePoseFromAnimation);
+
+	if (!bPoseCalibrated || !PoseSource)
+	{
+		return;
+	}
+
+	const TArray<FTransform>& Bones = PoseSource->GetComponentSpaceTransforms();
+
+	if (Bones.IsEmpty())
+	{
+		return;
+	}
+
+	const double ComputeStart = FPlatformTime::Seconds();
+	TArray<TPair<FSwarmPart*, FQuat>, TInlineAllocator<16>> Poses;
+
+	for (const FSwarmPartPoseCalibration& Calibration : PoseCalibration)
+	{
+		FSwarmPart* Part = Parts.Find(Calibration.PartId);
+
+		if (Part && Bones.IsValidIndex(Calibration.BoneIndex) && Bones.IsValidIndex(Calibration.ReferenceBoneIndex))
+		{
+			Poses.Emplace(Part, ComputePartPoseFromBones(Bones[Calibration.ReferenceBoneIndex].GetRotation(),
+				Bones[Calibration.BoneIndex].GetRotation(), Calibration.InverseRestRelative, Calibration.FrameCorrection));
+		}
+	}
+
+	const double ApplyStart = FPlatformTime::Seconds();
+
+	for (const TPair<FSwarmPart*, FQuat>& Pose : Poses)
+	{
+		ApplyPartPose(*Pose.Key, Pose.Value, /*bLog=*/false);
+	}
+
+	const double End = FPlatformTime::Seconds();
+	const double ComputeMs = (ApplyStart - ComputeStart) * 1000.0;
+	const double ApplyMs = (End - ApplyStart) * 1000.0;
+	++PoseFrames;
+	PoseComputeTotalMs += ComputeMs;
+	PoseComputeMaxMs = FMath::Max(PoseComputeMaxMs, ComputeMs);
+	PoseApplyTotalMs += ApplyMs;
+	PoseApplyMaxMs = FMath::Max(PoseApplyMaxMs, ApplyMs);
+
+	const double Now = GetWorld() ? GetWorld()->GetTimeSeconds() : 0.0;
+
+	if (PoseLogStartTime < 0.0)
+	{
+		PoseLogStartTime = Now;
+	}
+	else if (Now - PoseLogStartTime >= 1.0)
+	{
+		UE_LOG(LogSwarmBossManager, Display,
+			TEXT("Pose animation timing %s (per frame, all %d parts): Frames=%d Compute Avg=%.3fms Max=%.3fms Apply Avg=%.3fms Max=%.3fms (PoseSource evaluation excluded)"),
+			*GetName(), Poses.Num(), PoseFrames, PoseComputeTotalMs / PoseFrames, PoseComputeMaxMs,
+			PoseApplyTotalMs / PoseFrames, PoseApplyMaxMs);
+		PoseFrames = 0;
+		PoseComputeTotalMs = PoseComputeMaxMs = PoseApplyTotalMs = PoseApplyMaxMs = 0.0;
+		PoseLogStartTime = Now;
+	}
+
+	// 1회 재생이 끝났으면 복귀 애니메이션을 반복 재생한다(공격 1회 후 Idle).
+	// 단일 노드 재생은 끝에 닿은 프레임에 IsPlaying()이 아직 true일 수 있어 재생 위치가 길이에 닿았는지도 본다.
+	const UAnimSequence* Current = CurrentPoseAnimation.Get();
+	const bool bFinished = !PoseSource->IsPlaying()
+		|| (Current && PoseSource->GetPosition() >= Current->GetPlayLength() - KINDA_SMALL_NUMBER);
+
+	if (!bPoseAnimationLoops && bFinished && ReturnPoseAnimation)
+	{
+		PlayPoseAnimation(ReturnPoseAnimation, /*bLoop=*/true);
+	}
 }
 
 // 부위마다 현재 도형 반크기에 구체 반지름을 더한 로컬 상자를 월드로 변환해 합친다. 구는 세 축 반크기가 반지름이라 같은 식을 쓴다.
