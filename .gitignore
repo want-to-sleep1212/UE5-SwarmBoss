@@ -36,12 +36,15 @@ Saved/
 Thumbs.db
 Desktop.ini
 
-# 공개 저장소는 소스 코드만 올린다(아래는 로컬에만 둔다)
+# 공개 저장소에서 제외하는 로컬 프로젝트 파일
 /Content/
 /Config/
 /*.uproject
 /.vsconfig
-/Docs/
+/Docs/*
+!/Docs/SwarmGeneration.md
+!/Docs/HitAndReconstruction.md
+!/Docs/PoseAnimation.md
 /SwarmBossDesign.md
 /군체보스_목표위치생성_알고리즘_선정과정.md
 
