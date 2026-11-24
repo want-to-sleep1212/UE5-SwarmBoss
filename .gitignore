@@ -44,7 +44,6 @@ Desktop.ini
 /Docs/*
 !/Docs/SwarmGeneration.md
 !/Docs/HitAndReconstruction.md
-!/Docs/PoseAnimation.md
 !/Docs/Profiling.md
 /SwarmBossDesign.md
 /군체보스_목표위치생성_알고리즘_선정과정.md
