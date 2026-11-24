@@ -184,6 +184,7 @@ UInstancedStaticMeshComponent* ASwarmBossManager::GetPartInstances(ESwarmPartId 
 
 // Definition의 부위 목록과 Parts의 ISM 구성을 일치시킨다.
 // 목록에 없는 부위의 ISM은 파괴하고 Parts에서 제거하며, 목록에 새로 생긴 부위는 루트에 붙인 ISM을 만들어 등록한다.
+// 투사체는 Sweep으로 구체를 찾으므로 새 부위 ISM의 충돌 조회를 유지하고 겹침 이벤트 생성만 끈다.
 // 이미 있는 부위의 ISM은 재사용한다. 인스턴스와 대응표는 비우지 않으므로 호출 직후 InitializeParticles()로 다시 채워야 한다.
 void ASwarmBossManager::SyncPartInstances(const USwarmFormDefinition& Definition)
 {
@@ -232,6 +233,7 @@ void ASwarmBossManager::SyncPartInstances(const USwarmFormDefinition& Definition
 		Instances->SetupAttachment(GetRootComponent());
 		Instances->SetMobility(EComponentMobility::Movable);
 		Instances->SetCanEverAffectNavigation(false);
+		Instances->SetGenerateOverlapEvents(false);
 		Instances->SetCollisionProfileName(TEXT("SwarmSpherePreset"));
 		Instances->SetStaticMesh(SphereMesh);
 		Instances->RegisterComponent();
